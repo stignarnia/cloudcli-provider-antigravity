@@ -104,10 +104,10 @@ index b54c28f6..6ff6e850 100644
          dirName: entry.name,
 diff --git a/server/modules/plugins/provider-plugin-loader.ts b/server/modules/plugins/provider-plugin-loader.ts
 new file mode 100644
-index 00000000..fdb5603f
+index 00000000..0186416b
 --- /dev/null
 +++ b/server/modules/plugins/provider-plugin-loader.ts
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,119 @@
 +import path from 'node:path';
 +import { pathToFileURL } from 'node:url';
 +
@@ -199,7 +199,11 @@ index 00000000..fdb5603f
 +      if (!provider?.id || !meta?.capabilities) {
 +        throw new Error('provider factory must return { provider, meta } with provider.id and meta.capabilities');
 +      }
-+      if (typeof provider.id !== 'string' || !/^[a-z0-9_-]+$/.test(provider.id)) {
++      if (
++        typeof provider.id !== 'string'
++        || !/^[a-z0-9_-]+$/.test(provider.id)
++        || Object.prototype.hasOwnProperty.call(Object.prototype, provider.id)
++      ) {
 +        throw new Error(`invalid provider id "${provider.id}": must be lowercase alphanumeric, dashes or underscores`);
 +      }
 +      if (provider.id === 'plain-shell') {
@@ -1142,7 +1146,7 @@ index 7d8186f1..9f61c39e 100644
  };
  
 diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
-index 505f0d15..76fd5772 100644
+index 505f0d15..267a329f 100644
 --- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 +++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 @@ -1,6 +1,7 @@
@@ -1154,7 +1158,48 @@ index 505f0d15..76fd5772 100644
  import type {
    LLMProvider,
    ProviderAuthStatus,
-@@ -121,10 +122,27 @@ export function useProviderAuthStatus(
+@@ -85,7 +86,12 @@ export function useProviderAuthStatus(
+     }));
+   }, []);
+ 
++  const requestGenerationsRef = useRef<Record<string, number>>({});
++
+   const checkProviderAuthStatus = useCallback(async (provider: LLMProvider): Promise<ProviderAuthStatus> => {
++    const generation = (requestGenerationsRef.current[provider] ?? 0) + 1;
++    requestGenerationsRef.current[provider] = generation;
++
+     setProviderLoading(provider);
+ 
+     try {
+@@ -99,13 +105,17 @@ export function useProviderAuthStatus(
+           loading: false,
+           error: FALLBACK_STATUS_ERROR,
+         };
+-        setProviderStatus(provider, status);
++        if (requestGenerationsRef.current[provider] === generation) {
++          setProviderStatus(provider, status);
++        }
+         return status;
+       }
+ 
+       const payload = (await response.json()) as ProviderAuthStatusApiResponse;
+       const status = toProviderAuthStatus(payload.data);
+-      setProviderStatus(provider, status);
++      if (requestGenerationsRef.current[provider] === generation) {
++        setProviderStatus(provider, status);
++      }
+       return status;
+     } catch (caughtError) {
+       console.error(`Error checking ${provider} auth status:`, caughtError);
+@@ -116,15 +126,34 @@ export function useProviderAuthStatus(
+         loading: false,
+         error: toErrorMessage(caughtError),
+       };
+-      setProviderStatus(provider, status);
++      if (requestGenerationsRef.current[provider] === generation) {
++        setProviderStatus(provider, status);
++      }
+       return status;
      }
    }, [setProviderLoading, setProviderStatus]);
  
