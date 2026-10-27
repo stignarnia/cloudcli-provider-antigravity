@@ -244,10 +244,10 @@ index 7ecb4de6..68a0e599 100644
 +
 diff --git a/server/modules/providers/plugin-providers.store.ts b/server/modules/providers/plugin-providers.store.ts
 new file mode 100644
-index 00000000..836de9fe
+index 00000000..5faed227
 --- /dev/null
 +++ b/server/modules/providers/plugin-providers.store.ts
-@@ -0,0 +1,89 @@
+@@ -0,0 +1,105 @@
 +import type { IProvider } from '@/shared/interfaces.js';
 +import type { AnyRecord } from '@/shared/types.js';
 +
@@ -325,14 +325,30 @@ index 00000000..836de9fe
 +const pluginProviders = new Map<string, PluginProviderEntry>();
 +
 +export const pluginProvidersStore = {
++  /**
++   * Registers a provider plugin entry into the in-memory store.
++   *
++   * @param entry - The plugin provider entry containing provider instance and metadata.
++   */
 +  register(entry: PluginProviderEntry): void {
 +    pluginProviders.set(entry.provider.id, entry);
 +  },
 +
++  /**
++   * Retrieves a plugin provider entry by its provider ID.
++   *
++   * @param providerId - The unique provider identifier.
++   * @returns The registered PluginProviderEntry, or undefined if not found.
++   */
 +  get(providerId: string): PluginProviderEntry | undefined {
 +    return pluginProviders.get(providerId);
 +  },
 +
++  /**
++   * Lists all currently registered plugin provider entries.
++   *
++   * @returns Array of registered PluginProviderEntry objects.
++   */
 +  list(): PluginProviderEntry[] {
 +    return Array.from(pluginProviders.values());
 +  },
@@ -371,18 +387,17 @@ index 8c333fcb..96ca6fdb 100644
        throw new AppError(`Unsupported provider "${provider}".`, {
          code: 'UNSUPPORTED_PROVIDER',
 diff --git a/server/modules/providers/provider.routes.ts b/server/modules/providers/provider.routes.ts
-index 58c69f53..d6256c54 100644
+index 58c69f53..b756bc7d 100644
 --- a/server/modules/providers/provider.routes.ts
 +++ b/server/modules/providers/provider.routes.ts
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,6 @@
  import express, { type Request, type Response } from 'express';
  
-+import { providerRegistry } from '@/modules/providers/provider.registry.js';
-+import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
++import { pluginProvidersStore, providerRegistry } from './index.js';
  import { providerAuthService } from '@/modules/providers/services/provider-auth.service.js';
  import { claudeSettingsPermissionsService } from '@/modules/providers/services/claude-settings-permissions.service.js';
  import { providerCapabilitiesService } from '@/modules/providers/services/provider-capabilities.service.js';
-@@ -323,6 +325,11 @@ const parseProvider = (value: unknown): LLMProvider => {
+@@ -323,6 +324,11 @@ const parseProvider = (value: unknown): LLMProvider => {
      return normalized;
    }
  
@@ -394,11 +409,14 @@ index 58c69f53..d6256c54 100644
    throw new AppError(`Unsupported provider "${normalized}".`, {
      code: 'UNSUPPORTED_PROVIDER',
      statusCode: 400,
-@@ -856,6 +863,25 @@ router.get(
+@@ -856,6 +862,28 @@ router.get(
    }),
  );
  
-+// Providers loaded from plugins, with what the UI needs to show them (built-ins are hard-coded there).
++/**
++ * GET /api/providers/registry
++ * Returns providers loaded from plugins, with what the UI needs to show them (built-ins are hard-coded there).
++ */
 +router.get(
 +  '/registry',
 +  asyncHandler(async (_req: Request, res: Response) => {
@@ -421,7 +439,7 @@ index 58c69f53..d6256c54 100644
    '/:provider/capabilities',
    asyncHandler(async (req: Request, res: Response) => {
 diff --git a/server/modules/providers/services/provider-capabilities.service.ts b/server/modules/providers/services/provider-capabilities.service.ts
-index 5f7559b1..cf8ec7aa 100644
+index 5f7559b1..fce18580 100644
 --- a/server/modules/providers/services/provider-capabilities.service.ts
 +++ b/server/modules/providers/services/provider-capabilities.service.ts
 @@ -1,3 +1,4 @@
@@ -429,15 +447,28 @@ index 5f7559b1..cf8ec7aa 100644
  import type { LLMProvider } from '@/shared/types.js';
  
  /**
-@@ -127,10 +128,14 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
+@@ -126,11 +127,27 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
+  * service, which reads `effortLevels` to validate custom-model effort.
   */
  export const providerCapabilitiesService = {
++  /**
++   * Resolves the capabilities object for a given provider, checking built-ins first
++   * and falling back to registered provider plugins.
++   *
++   * @param provider - Provider ID to query capabilities for.
++   * @returns Capabilities description object for the provider.
++   */
    getProviderCapabilities(provider: LLMProvider): ProviderCapabilities {
 -    return PROVIDER_CAPABILITIES[provider];
 +    return (Object.hasOwn(PROVIDER_CAPABILITIES, provider) ? PROVIDER_CAPABILITIES[provider] : undefined)
 +      ?? (pluginProvidersStore.get(provider)?.meta.capabilities as ProviderCapabilities);
    },
  
++  /**
++   * Lists capabilities for all registered providers, including built-ins and plugins.
++   *
++   * @returns Array of ProviderCapabilities objects.
++   */
    listAllProviderCapabilities(): ProviderCapabilities[] {
 -    return Object.values(PROVIDER_CAPABILITIES);
 +    return [
@@ -447,7 +478,7 @@ index 5f7559b1..cf8ec7aa 100644
    },
  };
 diff --git a/server/modules/providers/services/provider-cli.service.ts b/server/modules/providers/services/provider-cli.service.ts
-index fba6b086..0d7c3fba 100644
+index fba6b086..aa0cf453 100644
 --- a/server/modules/providers/services/provider-cli.service.ts
 +++ b/server/modules/providers/services/provider-cli.service.ts
 @@ -1,5 +1,6 @@
@@ -457,7 +488,20 @@ index fba6b086..0d7c3fba 100644
  import { providerRegistry } from '@/modules/providers/provider.registry.js';
  import { sessionsService } from '@/modules/providers/services/sessions.service.js';
  import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
-@@ -182,7 +183,7 @@ function getProviderLabel(provider: LLMProvider): string {
+@@ -175,6 +176,12 @@ function formatCommand(command: string, args: string[]): string {
+   return [command, ...args].map(quote).join(' ');
+ }
+ 
++/**
++ * Resolves the display label for a provider, checking built-in names then plugin metadata.
++ *
++ * @param provider - Provider ID to look up.
++ * @returns Human-readable label for the provider.
++ */
+ function getProviderLabel(provider: LLMProvider): string {
+   const labels: Record<LLMProvider, string> = {
+     claude: 'Claude Code',
+@@ -182,7 +189,7 @@ function getProviderLabel(provider: LLMProvider): string {
      cursor: 'Cursor CLI',
      opencode: 'OpenCode',
    };
@@ -466,9 +510,16 @@ index fba6b086..0d7c3fba 100644
  }
  
  /**
-@@ -359,6 +360,10 @@ export function createProviderCliService(dependencyOverrides: Partial<ProviderCl
+@@ -358,7 +365,17 @@ export function createProviderCliService(dependencyOverrides: Partial<ProviderCl
+     return lookup;
    };
  
++  /**
++   * Resolves the update command and arguments for a provider, checking plugin metadata first.
++   *
++   * @param provider - Provider ID to check update command for.
++   * @returns Command and args object, or null if the provider is not updatable.
++   */
    const resolveUpdateCommand = (provider: LLMProvider): { command: string; args: string[] } | null => {
 +    const pluginUpdater = pluginProvidersStore.get(provider)?.meta.cliUpdater;
 +    if (pluginUpdater) {
@@ -1146,7 +1197,7 @@ index 7d8186f1..9f61c39e 100644
  };
  
 diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
-index 505f0d15..a5a25d81 100644
+index 505f0d15..d24f6ae2 100644
 --- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 +++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 @@ -1,6 +1,7 @@
@@ -1158,12 +1209,93 @@ index 505f0d15..a5a25d81 100644
  import type {
    LLMProvider,
    ProviderAuthStatus,
-@@ -85,7 +86,12 @@ export function useProviderAuthStatus(
+@@ -10,6 +11,12 @@ import type {
+ 
+ const CLI_PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
+ 
++/**
++ * Creates the initial auth status map for the four built-in providers.
++ *
++ * @param loading - Initial loading flag state for each provider.
++ * @returns Map of built-in providers to their initial auth status.
++ */
+ const createInitialProviderAuthStatusMap = (loading = true): ProviderAuthStatusMap => ({
+   claude: { authenticated: false, email: null, method: null, error: null, loading },
+   cursor: { authenticated: false, email: null, method: null, error: null, loading },
+@@ -34,10 +41,23 @@ type ProviderAuthStatusApiResponse = {
+ const FALLBACK_STATUS_ERROR = 'Failed to check authentication status';
+ const FALLBACK_UNKNOWN_ERROR = 'Unknown error';
+ 
++/**
++ * Normalizes caught errors into human-readable strings.
++ *
++ * @param error - The caught rejection reason or exception.
++ * @returns Error message string.
++ */
+ const toErrorMessage = (error: unknown): string => (
+   error instanceof Error ? error.message : FALLBACK_UNKNOWN_ERROR
+ );
+ 
++/**
++ * Normalizes an API status payload into a ProviderAuthStatus object.
++ *
++ * @param payload - Raw API status payload.
++ * @param fallbackError - Error message to use when payload lacks an error.
++ * @returns Normalized ProviderAuthStatus.
++ */
+ const toProviderAuthStatus = (
+   payload: ProviderAuthStatusPayload,
+   fallbackError: string | null = null,
+@@ -60,6 +80,12 @@ type UseProviderAuthStatusOptions = {
+   initialLoading?: boolean;
+ };
+ 
++/**
++ * Hook managing authentication statuses for built-in and plugin providers.
++ *
++ * @param options - Hook configuration options.
++ * @returns Provider auth status map, check method, and bulk refresh method.
++ */
+ export function useProviderAuthStatus(
+   { initialLoading = true }: UseProviderAuthStatusOptions = {},
+ ) {
+@@ -67,6 +93,11 @@ export function useProviderAuthStatus(
+     createInitialProviderAuthStatusMap(initialLoading)
+   ));
+ 
++  /**
++   * Sets the loading flag for a provider's auth status.
++   *
++   * @param provider - Provider ID to set as loading.
++   */
+   const setProviderLoading = useCallback((provider: LLMProvider) => {
+     setProviderAuthStatus((previous) => ({
+       ...previous,
+@@ -78,6 +109,12 @@ export function useProviderAuthStatus(
+     }));
+   }, []);
+ 
++  /**
++   * Updates the resolved auth status for a provider.
++   *
++   * @param provider - Provider ID to update.
++   * @param status - Resolved ProviderAuthStatus.
++   */
+   const setProviderStatus = useCallback((provider: LLMProvider, status: ProviderAuthStatus) => {
+     setProviderAuthStatus((previous) => ({
+       ...previous,
+@@ -85,7 +122,18 @@ export function useProviderAuthStatus(
      }));
    }, []);
  
 +  const requestGenerationsRef = useRef<Record<string, number>>({});
 +
++  /**
++   * Checks the authentication status for a single provider.
++   *
++   * @param provider - Provider ID to check.
++   * @returns Promise resolving to the provider's auth status.
++   */
    const checkProviderAuthStatus = useCallback(async (provider: LLMProvider): Promise<ProviderAuthStatus> => {
 +    const generation = (requestGenerationsRef.current[provider] ?? 0) + 1;
 +    requestGenerationsRef.current[provider] = generation;
@@ -1171,7 +1303,7 @@ index 505f0d15..a5a25d81 100644
      setProviderLoading(provider);
  
      try {
-@@ -99,13 +105,17 @@ export function useProviderAuthStatus(
+@@ -99,13 +147,17 @@ export function useProviderAuthStatus(
            loading: false,
            error: FALLBACK_STATUS_ERROR,
          };
@@ -1191,7 +1323,7 @@ index 505f0d15..a5a25d81 100644
        return status;
      } catch (caughtError) {
        console.error(`Error checking ${provider} auth status:`, caughtError);
-@@ -116,15 +126,34 @@ export function useProviderAuthStatus(
+@@ -116,15 +168,39 @@ export function useProviderAuthStatus(
          loading: false,
          error: toErrorMessage(caughtError),
        };
@@ -1204,6 +1336,11 @@ index 505f0d15..a5a25d81 100644
    }, [setProviderLoading, setProviderStatus]);
  
 -  const refreshProviderAuthStatuses = useCallback(async (providers: LLMProvider[] = CLI_PROVIDERS) => {
++  /**
++   * Refreshes authentication statuses for a list of providers (defaults to all providers).
++   *
++   * @param providers - Array of LLMProvider IDs to refresh.
++   */
 +  const refreshProviderAuthStatuses = useCallback(async (providers: LLMProvider[] = withPluginProviderIds(CLI_PROVIDERS)) => {
      await Promise.all(providers.map((provider) => checkProviderAuthStatus(provider)));
    }, [checkProviderAuthStatus]);
@@ -1549,10 +1686,10 @@ index 7c485fa4..a0a4a847 100644
  
 diff --git a/src/shared/providerRegistry.ts b/src/shared/providerRegistry.ts
 new file mode 100644
-index 00000000..e09c7dd4
+index 00000000..f9077f83
 --- /dev/null
 +++ b/src/shared/providerRegistry.ts
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,149 @@
 +import { useEffect, useSyncExternalStore } from 'react';
 +
 +import { api } from '@/shared/api';
@@ -1587,6 +1724,11 @@ index 00000000..e09c7dd4
 +
 +const CACHE_KEY = 'cloudcli.pluginProviders';
 +
++/**
++ * Reads cached plugin providers from localStorage for fast initial render.
++ *
++ * @returns Cached array of plugin provider info or an empty array if missing.
++ */
 +const readCache = (): PluginProviderInfo[] => {
 +  try {
 +    const cached = JSON.parse(window.localStorage.getItem(CACHE_KEY) ?? '[]');
@@ -1602,6 +1744,11 @@ index 00000000..e09c7dd4
 +let loadRequest: Promise<void> | null = null;
 +const listeners = new Set<() => void>();
 +
++/**
++ * Loads registered plugin providers from the server registry endpoint.
++ *
++ * @returns A promise that resolves when the registry fetch and state update finish.
++ */
 +export function loadPluginProviders(): Promise<void> {
 +  if (loadRequest) {
 +    return loadRequest;
@@ -1633,6 +1780,12 @@ index 00000000..e09c7dd4
 +  return loadRequest;
 +}
 +
++/**
++ * Subscribes a listener callback to changes in the registered plugin providers.
++ *
++ * @param listener - Function invoked whenever plugin providers are updated.
++ * @returns Unsubscribe function to remove the listener.
++ */
 +const subscribe = (listener: () => void) => {
 +  listeners.add(listener);
 +  return () => {
@@ -1640,12 +1793,28 @@ index 00000000..e09c7dd4
 +  };
 +};
 +
++/**
++ * Gets a snapshot of current plugin providers for useSyncExternalStore.
++ *
++ * @returns Current array of plugin providers.
++ */
 +const getSnapshot = () => pluginProviders;
 +
++/**
++ * Returns all currently loaded plugin providers.
++ *
++ * @returns Array of loaded plugin provider info objects.
++ */
 +export function getPluginProviders(): PluginProviderInfo[] {
 +  return pluginProviders;
 +}
 +
++/**
++ * Looks up a registered plugin provider by its provider ID.
++ *
++ * @param id - Provider identifier string.
++ * @returns Matching plugin provider info or undefined if not found.
++ */
 +export function getPluginProvider(id: string | null | undefined): PluginProviderInfo | undefined {
 +  return id ? pluginProviders.find((provider) => provider.id === id) : undefined;
 +}
@@ -1671,7 +1840,7 @@ index 00000000..e09c7dd4
 +  return providers;
 +}
 diff --git a/src/shared/selectedProvider.ts b/src/shared/selectedProvider.ts
-index 222f8607..35b8f4e6 100644
+index 222f8607..f8556f43 100644
 --- a/src/shared/selectedProvider.ts
 +++ b/src/shared/selectedProvider.ts
 @@ -1,3 +1,4 @@
@@ -1679,8 +1848,16 @@ index 222f8607..35b8f4e6 100644
  import type { LLMProvider } from '@/shared/types';
  import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
  
-@@ -22,7 +23,9 @@ const DEFAULT_PROVIDER: LLMProvider = 'claude';
+@@ -20,11 +21,24 @@ const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
  
+ const DEFAULT_PROVIDER: LLMProvider = 'claude';
+ 
++/**
++ * Reads the active selected provider from persisted user preferences,
++ * validating against both built-in providers and registered plugin providers.
++ *
++ * @returns The selected LLMProvider, falling back to DEFAULT_PROVIDER ('claude').
++ */
  export function readSelectedProvider(): LLMProvider {
    const stored = readUserPreference<string | null>('selectedProvider', null);
 -  return PROVIDERS.includes(stored as LLMProvider) ? (stored as LLMProvider) : DEFAULT_PROVIDER;
@@ -1689,7 +1866,14 @@ index 222f8607..35b8f4e6 100644
 +    : DEFAULT_PROVIDER;
  }
  
++/**
++ * Persists the user's selected provider to preferences.
++ *
++ * @param provider - The LLMProvider to set as active.
++ */
  export function writeSelectedProvider(provider: LLMProvider): void {
+   writeUserPreference('selectedProvider', provider);
+ }
 diff --git a/src/shared/types.ts b/src/shared/types.ts
 index 6058d70e..a4630448 100644
 --- a/src/shared/types.ts
