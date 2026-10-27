@@ -13,8 +13,8 @@ This plugin adds Google Antigravity as a chat provider in CloudCLI. It uses the 
 Clone the published repository, then run the installer from its directory:
 
 ```sh
-git clone <repository-url> antigravity-provider
-cd antigravity-provider
+git clone https://github.com/stignarnia/cloudcli-provider-antigravity.git
+cd cloudcli-provider-antigravity
 ./install.sh
 ```
 
