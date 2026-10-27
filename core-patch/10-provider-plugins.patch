@@ -1,0 +1,1637 @@
+diff --git a/server/index.ts b/server/index.ts
+index 98cd213a..dfae6c58 100644
+--- a/server/index.ts
++++ b/server/index.ts
+@@ -36,6 +36,7 @@ import notificationRoutes from './modules/notifications/notifications.routes.js'
+ import { userRoutes } from './modules/user/index.js';
+ import {
+     getPluginPort,
++    loadProviderPlugins,
+     pluginsRoutes,
+     startEnabledPluginServers,
+     stopAllPlugins,
+@@ -337,6 +338,9 @@ async function startServer() {
+         // Configure Web Push (VAPID keys)
+         configureWebPush();
+ 
++        // Chat providers from plugins, registered before the session watcher indexes sessions
++        await loadProviderPlugins();
++
+         // Check if running in production mode (dist folder exists)
+         const distIndexPath = path.join(APP_ROOT, 'dist', 'index.html');
+         const isProduction = fs.existsSync(distIndexPath);
+diff --git a/server/modules/commands/commands.routes.ts b/server/modules/commands/commands.routes.ts
+index 46745e7a..b592dcd3 100644
+--- a/server/modules/commands/commands.routes.ts
++++ b/server/modules/commands/commands.routes.ts
+@@ -4,6 +4,7 @@ import path from "path";
+ import express from "express";
+ 
+ import { parseFrontMatter } from "../../shared/frontmatter.js";
++import { pluginProvidersStore } from "../providers/plugin-providers.store.js";
+ 
+ type CommandsRouterDependencies = {
+   fileSystem: typeof import('node:fs/promises');
+@@ -60,7 +61,7 @@ const readModelProvider = (value) => {
+   }
+ 
+   const normalized = value.trim().toLowerCase();
+-  return MODEL_PROVIDERS.includes(normalized) ? normalized : "claude";
++  return MODEL_PROVIDERS.includes(normalized) || pluginProvidersStore.get(normalized) ? normalized : "claude";
+ };
+ 
+ /**
+@@ -97,7 +98,7 @@ const executeModelsCommand = async (args, context, modelsService) => {
+     data: {
+       current: {
+         provider: currentProvider,
+-        providerLabel: MODEL_PROVIDER_LABELS[currentProvider],
++        providerLabel: MODEL_PROVIDER_LABELS[currentProvider] ?? pluginProvidersStore.get(currentProvider)?.meta.label,
+         model: currentModel,
+       },
+       available: {
+diff --git a/server/modules/plugins/index.ts b/server/modules/plugins/index.ts
+index 9143f0e8..e48e42c6 100644
+--- a/server/modules/plugins/index.ts
++++ b/server/modules/plugins/index.ts
+@@ -5,5 +5,8 @@ export { pluginsRoutes } from './plugins.module.js';
+ export { startEnabledPluginServers } from './plugin-process.service.js';
+ // stopAllPlugins: used by the server entrypoint to stop plugin subprocesses during shutdown.
+ export { stopAllPlugins } from './plugin-process.service.js';
++// loadProviderPlugins: used by the server entrypoint to register chat providers from plugins before the session watcher starts.
++export { loadProviderPlugins } from './provider-plugin-loader.js';
++export type { ProviderPluginHost } from './provider-plugin-loader.js';
+ // getPluginPort: used by WebSocket setup in the server entrypoint to proxy plugin connections.
+ export { getPluginPort } from './plugin-process.service.js';
+diff --git a/server/modules/plugins/plugin-registry.service.ts b/server/modules/plugins/plugin-registry.service.ts
+index b54c28f6..6ff6e850 100644
+--- a/server/modules/plugins/plugin-registry.service.ts
++++ b/server/modules/plugins/plugin-registry.service.ts
+@@ -27,7 +27,8 @@ function sanitizeRepoUrl(raw) {
+   }
+ }
+ const ALLOWED_TYPES = ['react', 'module'];
+-const ALLOWED_SLOTS = ['tab'];
++// 'provider' plugins add a chat provider instead of a tab (provider-plugin-loader.ts).
++const ALLOWED_SLOTS = ['tab', 'provider'];
+ 
+ export function getPluginsDir() {
+   if (!fs.existsSync(PLUGINS_DIR)) {
+@@ -90,6 +91,16 @@ export function validateManifest(manifest) {
+     }
+   }
+ 
++  if (manifest.provider !== undefined && manifest.provider !== null) {
++    if (typeof manifest.provider !== 'string' || manifest.provider.includes('..') || path.isAbsolute(manifest.provider)) {
++      return { valid: false, error: 'Provider entry must be a relative path string without ".."' };
++    }
++  }
++
++  if (manifest.slot === 'provider' && !manifest.provider) {
++    return { valid: false, error: 'Provider plugins must declare a "provider" entry' };
++  }
++
+   if (manifest.permissions !== undefined) {
+     if (!Array.isArray(manifest.permissions) || !manifest.permissions.every(p => typeof p === 'string')) {
+       return { valid: false, error: 'Permissions must be an array of strings' };
+@@ -215,6 +226,7 @@ export function scanPlugins() {
+         slot: manifest.slot || 'tab',
+         entry: manifest.entry,
+         server: manifest.server || null,
++        provider: manifest.provider || null,
+         permissions: manifest.permissions || [],
+         enabled: config[manifest.name]?.enabled !== false, // enabled by default
+         dirName: entry.name,
+diff --git a/server/modules/plugins/provider-plugin-loader.ts b/server/modules/plugins/provider-plugin-loader.ts
+new file mode 100644
+index 00000000..d9550c70
+--- /dev/null
++++ b/server/modules/plugins/provider-plugin-loader.ts
+@@ -0,0 +1,109 @@
++import path from 'node:path';
++import { pathToFileURL } from 'node:url';
++
++import Database from 'better-sqlite3';
++
++import { sessionsDb } from '@/modules/database/index.js';
++import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
++import {
++  pluginProvidersStore,
++  type PluginProviderMeta,
++} from '@/modules/providers/plugin-providers.store.js';
++import { providerRegistry } from '@/modules/providers/provider.registry.js';
++import { McpProvider } from '@/modules/providers/shared/mcp/mcp.provider.js';
++import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
++import * as imageAttachments from '@/shared/image-attachments.js';
++import type { IProvider } from '@/shared/interfaces.js';
++import * as utils from '@/shared/utils.js';
++
++import { getPluginsDir, scanPlugins } from './plugin-registry.service.js';
++
++/**
++ * What a provider plugin receives from the host. A plugin lives outside this
++ * repository and cannot import its `@/...` modules, so the pieces a provider
++ * implementation needs are handed over here instead.
++ */
++export type ProviderPluginHost = {
++  pluginName: string;
++  pluginDir: string;
++  utils: typeof utils;
++  attachments: typeof imageAttachments;
++  sessionsDb: typeof sessionsDb;
++  notifications: {
++    notifyRunStopped: typeof notifyRunStopped;
++    notifyRunFailed: typeof notifyRunFailed;
++  };
++  /** The host's better-sqlite3, so plugins need no native build of their own. */
++  Database: typeof Database;
++  /** Base classes the built-in providers extend for MCP config and SKILL.md handling. */
++  bases: {
++    McpProvider: typeof McpProvider;
++    SkillsProvider: typeof SkillsProvider;
++  };
++};
++
++export type ProviderPluginModule = {
++  default: (host: ProviderPluginHost) => Promise<ProviderPluginExports> | ProviderPluginExports;
++};
++
++type ProviderPluginExports = {
++  provider: IProvider;
++  meta: PluginProviderMeta;
++};
++
++/**
++ * Loads the chat providers of enabled `slot: "provider"` plugins into the
++ * provider registry. Runs in-process (unlike tab plugin servers), because a
++ * provider implements IProvider directly. Must run before the session watcher
++ * starts so their sessions are indexed and watched.
++ *
++ * A broken plugin is logged and skipped; it never stops the server.
++ */
++export async function loadProviderPlugins(): Promise<void> {
++  const providerPlugins = scanPlugins().filter((plugin) => plugin.slot === 'provider' && plugin.enabled);
++
++  for (const plugin of providerPlugins) {
++    const pluginDir = path.join(getPluginsDir(), plugin.dirName);
++    try {
++      const entryPath = path.resolve(pluginDir, plugin.provider);
++      if (!entryPath.startsWith(pluginDir + path.sep)) {
++        throw new Error('provider entry resolves outside the plugin directory');
++      }
++
++      const pluginModule = (await import(pathToFileURL(entryPath).href)) as ProviderPluginModule;
++      if (typeof pluginModule.default !== 'function') {
++        throw new Error('provider entry has no default export factory');
++      }
++
++      const { provider, meta } = await pluginModule.default({
++        pluginName: plugin.name,
++        pluginDir,
++        utils,
++        attachments: imageAttachments,
++        sessionsDb,
++        notifications: { notifyRunStopped, notifyRunFailed },
++        Database,
++        bases: { McpProvider, SkillsProvider },
++      });
++
++      if (!provider?.id || !meta?.capabilities) {
++        throw new Error('provider factory must return { provider, meta } with provider.id and meta.capabilities');
++      }
++      if (providerRegistry.hasProvider(provider.id)) {
++        throw new Error(`provider id "${provider.id}" is already registered`);
++      }
++
++      pluginProvidersStore.register({
++        pluginName: plugin.name,
++        pluginIcon: plugin.icon && plugin.icon !== 'Puzzle' ? plugin.icon : null,
++        hasSettingsPanel: Boolean(plugin.entry) && plugin.entry !== plugin.provider,
++        provider,
++        meta,
++      });
++      console.log(`[Plugins] Loaded provider "${provider.id}" from ${plugin.name}`);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      console.error(`[Plugins] Failed to load provider plugin ${plugin.name}: ${message}`);
++    }
++  }
++}
+diff --git a/server/modules/providers/plugin-providers.store.ts b/server/modules/providers/plugin-providers.store.ts
+new file mode 100644
+index 00000000..894a922d
+--- /dev/null
++++ b/server/modules/providers/plugin-providers.store.ts
+@@ -0,0 +1,89 @@
++import type { IProvider } from '@/shared/interfaces.js';
++import type { AnyRecord } from '@/shared/types.js';
++
++/**
++ * Capability description a plugin provider supplies about itself. Same shape
++ * as the built-in capability matrix in provider-capabilities.service.ts.
++ */
++export type PluginProviderCapabilities = {
++  provider: string;
++  permissionModes: string[];
++  permissionModeOptions?: Record<string, { label: string; description: string }>;
++  defaultPermissionMode: string;
++  supportsImages: boolean;
++  supportsFiles: boolean;
++  supportsAbort: boolean;
++  supportsPermissionRequests: boolean;
++  supportsTokenUsage: boolean;
++  supportsEffort: boolean;
++  effortLevels: string[];
++  supportsMessageEditing: boolean;
++  supportsSessionForking: boolean;
++  /** Not part of the built-in matrix: lets the UI hide settings panels a plugin does not implement. */
++  supportsMcp?: boolean;
++  supportsSkills?: boolean;
++  /** Install location shown in the skills panel, e.g. `~/.foo/skills/<skill-name>/SKILL.md`. */
++  skillsPath?: string;
++};
++
++/**
++ * Everything the core needs to know about a provider that is not on IProvider
++ * itself. Built-in providers keep this knowledge hard-coded across the server
++ * and the UI; plugin providers hand it over once, at load time.
++ */
++export type PluginProviderMeta = {
++  label: string;
++  /** Short vendor line shown under the label in the provider picker. */
++  description?: string;
++  /** Command run in the login terminal (Settings > Agents > Account). */
++  loginCommand?: string;
++  capabilities: PluginProviderCapabilities;
++  /** Directories whose changes should trigger `sessionSynchronizer.synchronizeFile`. */
++  watchRoots?: string[];
++  /** Filters watcher events below `watchRoots`; every file is accepted when omitted. */
++  isWatchTarget?: (filePath: string) => boolean;
++  /** Shell tab command; `resumeSessionId` is the provider-native id when resuming. */
++  shellCommand?: (options: { resumeSessionId: string | null; projectPath: string }) => string;
++  /** Token usage for the token budget endpoint; `null` reports "unsupported". */
++  getTokenUsage?: (providerSessionId: string) => Promise<AnyRecord | null> | AnyRecord | null;
++  /** The CLI's own updater, offered in Settings > Agents; without it the CLI counts as not updatable here. */
++  cliUpdater?: { command: string; args: string[] };
++};
++
++export type PluginProviderEntry = {
++  /** Name of the plugin that registered the provider. */
++  pluginName: string;
++  /** The plugin's manifest icon (an SVG asset path), used as the provider logo. */
++  pluginIcon: string | null;
++  /**
++   * Whether the plugin ships its own settings UI: a manifest `entry` (mounted
++   * like a tab plugin, with its `server` for RPC) other than the provider
++   * module. Shown as the provider's Permissions panel in Settings > Agents.
++   */
++  hasSettingsPanel: boolean;
++  provider: IProvider;
++  meta: PluginProviderMeta;
++};
++
++/**
++ * Process-wide store of providers loaded from plugins.
++ *
++ * Deliberately dependency-free (type imports only) so the provider registry,
++ * the capability matrix and the session watcher can all read it without
++ * creating an import cycle.
++ */
++const pluginProviders = new Map<string, PluginProviderEntry>();
++
++export const pluginProvidersStore = {
++  register(entry: PluginProviderEntry): void {
++    pluginProviders.set(entry.provider.id, entry);
++  },
++
++  get(providerId: string): PluginProviderEntry | undefined {
++    return pluginProviders.get(providerId);
++  },
++
++  list(): PluginProviderEntry[] {
++    return Array.from(pluginProviders.values());
++  },
++};
+diff --git a/server/modules/providers/provider.registry.ts b/server/modules/providers/provider.registry.ts
+index 8c333fcb..96ca6fdb 100644
+--- a/server/modules/providers/provider.registry.ts
++++ b/server/modules/providers/provider.registry.ts
+@@ -2,6 +2,7 @@ import { ClaudeProvider } from '@/modules/providers/list/claude/claude.provider.
+ import { CodexProvider } from '@/modules/providers/list/codex/codex.provider.js';
+ import { CursorProvider } from '@/modules/providers/list/cursor/cursor.provider.js';
+ import { OpenCodeProvider } from '@/modules/providers/list/opencode/opencode.provider.js';
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import type { IProvider } from '@/shared/interfaces.js';
+ import type { LLMProvider } from '@/shared/types.js';
+ import { AppError } from '@/shared/utils.js';
+@@ -18,12 +19,18 @@ const providers: Record<LLMProvider, IProvider> = {
+  */
+ export const providerRegistry = {
+   listProviders(): IProvider[] {
+-    return Object.values(providers);
++    // Plugin providers (provider-plugin-loader.ts) come after the built-ins.
++    return [...Object.values(providers), ...pluginProvidersStore.list().map((entry) => entry.provider)];
++  },
++
++  hasProvider(provider: string): boolean {
++    return Object.hasOwn(providers, provider) || Boolean(pluginProvidersStore.get(provider));
+   },
+ 
+   resolveProvider(provider: string): IProvider {
+     const key = provider as LLMProvider;
+-    const resolvedProvider = providers[key];
++    const resolvedProvider = (Object.hasOwn(providers, key) ? providers[key] : undefined)
++      ?? pluginProvidersStore.get(provider)?.provider;
+     if (!resolvedProvider) {
+       throw new AppError(`Unsupported provider "${provider}".`, {
+         code: 'UNSUPPORTED_PROVIDER',
+diff --git a/server/modules/providers/provider.routes.ts b/server/modules/providers/provider.routes.ts
+index 58c69f53..d6256c54 100644
+--- a/server/modules/providers/provider.routes.ts
++++ b/server/modules/providers/provider.routes.ts
+@@ -1,5 +1,7 @@
+ import express, { type Request, type Response } from 'express';
+ 
++import { providerRegistry } from '@/modules/providers/provider.registry.js';
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import { providerAuthService } from '@/modules/providers/services/provider-auth.service.js';
+ import { claudeSettingsPermissionsService } from '@/modules/providers/services/claude-settings-permissions.service.js';
+ import { providerCapabilitiesService } from '@/modules/providers/services/provider-capabilities.service.js';
+@@ -323,6 +325,11 @@ const parseProvider = (value: unknown): LLMProvider => {
+     return normalized;
+   }
+ 
++  // Plugin provider ids are outside the LLMProvider union by design.
++  if (providerRegistry.hasProvider(normalized)) {
++    return normalized as LLMProvider;
++  }
++
+   throw new AppError(`Unsupported provider "${normalized}".`, {
+     code: 'UNSUPPORTED_PROVIDER',
+     statusCode: 400,
+@@ -856,6 +863,25 @@ router.get(
+   }),
+ );
+ 
++// Providers loaded from plugins, with what the UI needs to show them (built-ins are hard-coded there).
++router.get(
++  '/registry',
++  asyncHandler(async (_req: Request, res: Response) => {
++    res.json(createApiSuccessResponse({
++      providers: pluginProvidersStore.list().map(({ pluginName, pluginIcon, hasSettingsPanel, provider, meta }) => ({
++        id: provider.id,
++        pluginName,
++        pluginIcon,
++        label: meta.label,
++        description: meta.description ?? '',
++        loginCommand: meta.loginCommand ?? null,
++        capabilities: meta.capabilities,
++        settingsPanel: hasSettingsPanel,
++      })),
++    }));
++  }),
++);
++
+ router.get(
+   '/:provider/capabilities',
+   asyncHandler(async (req: Request, res: Response) => {
+diff --git a/server/modules/providers/services/provider-capabilities.service.ts b/server/modules/providers/services/provider-capabilities.service.ts
+index 5f7559b1..cf8ec7aa 100644
+--- a/server/modules/providers/services/provider-capabilities.service.ts
++++ b/server/modules/providers/services/provider-capabilities.service.ts
+@@ -1,3 +1,4 @@
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import type { LLMProvider } from '@/shared/types.js';
+ 
+ /**
+@@ -127,10 +128,14 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
+  */
+ export const providerCapabilitiesService = {
+   getProviderCapabilities(provider: LLMProvider): ProviderCapabilities {
+-    return PROVIDER_CAPABILITIES[provider];
++    return (Object.hasOwn(PROVIDER_CAPABILITIES, provider) ? PROVIDER_CAPABILITIES[provider] : undefined)
++      ?? (pluginProvidersStore.get(provider)?.meta.capabilities as ProviderCapabilities);
+   },
+ 
+   listAllProviderCapabilities(): ProviderCapabilities[] {
+-    return Object.values(PROVIDER_CAPABILITIES);
++    return [
++      ...Object.values(PROVIDER_CAPABILITIES),
++      ...pluginProvidersStore.list().map((entry) => entry.meta.capabilities as ProviderCapabilities),
++    ];
+   },
+ };
+diff --git a/server/modules/providers/services/provider-cli.service.ts b/server/modules/providers/services/provider-cli.service.ts
+index fba6b086..0d7c3fba 100644
+--- a/server/modules/providers/services/provider-cli.service.ts
++++ b/server/modules/providers/services/provider-cli.service.ts
+@@ -1,5 +1,6 @@
+ import spawn from 'cross-spawn';
+ 
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import { providerRegistry } from '@/modules/providers/provider.registry.js';
+ import { sessionsService } from '@/modules/providers/services/sessions.service.js';
+ import { resolveClaudeCodeExecutablePath } from '@/shared/claude-cli-path.js';
+@@ -182,7 +183,7 @@ function getProviderLabel(provider: LLMProvider): string {
+     cursor: 'Cursor CLI',
+     opencode: 'OpenCode',
+   };
+-  return labels[provider];
++  return labels[provider] ?? pluginProvidersStore.get(provider)?.meta.label ?? provider;
+ }
+ 
+ /**
+@@ -359,6 +360,10 @@ export function createProviderCliService(dependencyOverrides: Partial<ProviderCl
+   };
+ 
+   const resolveUpdateCommand = (provider: LLMProvider): { command: string; args: string[] } | null => {
++    const pluginUpdater = pluginProvidersStore.get(provider)?.meta.cliUpdater;
++    if (pluginUpdater) {
++      return { command: pluginUpdater.command, args: pluginUpdater.args };
++    }
+     const updater = CLI_UPDATERS[provider];
+     const command = updater?.resolveCommand();
+     return updater && command ? { command, args: updater.args } : null;
+diff --git a/server/modules/providers/services/provider-token-usage.service.ts b/server/modules/providers/services/provider-token-usage.service.ts
+index d5ce5832..1148d6b4 100644
+--- a/server/modules/providers/services/provider-token-usage.service.ts
++++ b/server/modules/providers/services/provider-token-usage.service.ts
+@@ -6,6 +6,7 @@ import path from 'node:path';
+ import Database from 'better-sqlite3';
+ 
+ import { sessionsDb } from '@/modules/database/index.js';
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import type { AnyRecord } from '@/shared/types.js';
+ import { AppError, getOpenCodeDatabasePath } from '@/shared/utils.js';
+ 
+@@ -436,6 +437,20 @@ export function createProviderTokenUsageService(
+ 
+       const providerSessionId = session.provider_session_id || sessionId;
+ 
++      const pluginProvider = pluginProvidersStore.get(session.provider);
++      if (pluginProvider) {
++        const pluginUsage = await pluginProvider.meta.getTokenUsage?.(providerSessionId);
++        return (pluginUsage as TokenUsageResult | null | undefined) ?? {
++          used: 0,
++          total: 0,
++          inputTokens: 0,
++          outputTokens: 0,
++          breakdown: { input: 0, output: 0 },
++          unsupported: true,
++          message: `Token usage tracking not available for ${pluginProvider.meta.label} sessions`,
++        };
++      }
++
+       if (session.provider === 'cursor') {
+         return {
+           used: 0,
+diff --git a/server/modules/providers/services/sessions-watcher.service.ts b/server/modules/providers/services/sessions-watcher.service.ts
+index 2f9e5a9e..7d3143b8 100644
+--- a/server/modules/providers/services/sessions-watcher.service.ts
++++ b/server/modules/providers/services/sessions-watcher.service.ts
+@@ -4,6 +4,7 @@ import { promises as fsPromises } from 'node:fs';
+ 
+ import chokidar, { type FSWatcher } from 'chokidar';
+ 
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
+ import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
+ import type { LLMProvider } from '@/shared/types.js';
+@@ -106,6 +107,11 @@ let watcherRescheduleAfterRefresh = false;
+  * Filters watcher events to provider-specific session artifact file types.
+  */
+ function isWatcherTargetFile(provider: LLMProvider, filePath: string): boolean {
++  const pluginProvider = pluginProvidersStore.get(provider);
++  if (pluginProvider) {
++    return pluginProvider.meta.isWatchTarget?.(filePath) ?? true;
++  }
++
+   if (provider === 'opencode') {
+     return path.basename(filePath) === 'opencode.db';
+   }
+@@ -243,7 +249,11 @@ export async function initializeSessionsWatcher(): Promise<void> {
+     failures: initialSync.failures,
+   });
+ 
+-  for (const { provider, rootPath } of PROVIDER_WATCH_PATHS) {
++  const pluginWatchPaths = pluginProvidersStore.list().flatMap(({ provider, meta }) => (
++    (meta.watchRoots ?? []).map((rootPath) => ({ provider: provider.id, rootPath }))
++  ));
++
++  for (const { provider, rootPath } of [...PROVIDER_WATCH_PATHS, ...pluginWatchPaths]) {
+     try {
+       await fsPromises.mkdir(rootPath, { recursive: true });
+ 
+diff --git a/server/modules/websocket/services/shell-websocket.service.ts b/server/modules/websocket/services/shell-websocket.service.ts
+index 84db54c9..8068652a 100644
+--- a/server/modules/websocket/services/shell-websocket.service.ts
++++ b/server/modules/websocket/services/shell-websocket.service.ts
+@@ -5,6 +5,7 @@ import path from 'node:path';
+ import pty, { type IPty } from 'node-pty';
+ import { WebSocket, type RawData } from 'ws';
+ 
++import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
+ import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/utils.js';
+ 
+ type ShellIncomingMessage = {
+@@ -226,6 +227,11 @@ function buildShellCommand(
+     return otherProgram(initialCommand);
+   }
+ 
++  const pluginShellCommand = pluginProvidersStore.get(provider)?.meta.shellCommand;
++  if (pluginShellCommand) {
++    return otherProgram(pluginShellCommand({ resumeSessionId, projectPath }));
++  }
++
+   if (provider === 'cursor') {
+     if (resumeSessionId) {
+       return otherProgram(`cursor-agent --resume="${resumeSessionId}"`);
+@@ -789,7 +795,7 @@ export function handleShellConnection(
+                 ? 'Codex'
+                 : provider === 'opencode'
+                     ? 'OpenCode'
+-                  : 'Claude';
++                  : pluginProvidersStore.get(provider)?.meta.label ?? 'Claude';
+           welcomeMsg = hasSession && resumeSessionId
+             ? `\x1b[36mResuming ${providerName} session ${resumeSessionId} in: ${projectPath}\x1b[0m\r\n`
+             : `\x1b[36mStarting new ${providerName} session in: ${projectPath}\x1b[0m\r\n`;
+diff --git a/src/modules/chat/ChatInterface.tsx b/src/modules/chat/ChatInterface.tsx
+index 145e9a2b..3971ae69 100644
+--- a/src/modules/chat/ChatInterface.tsx
++++ b/src/modules/chat/ChatInterface.tsx
+@@ -9,6 +9,7 @@ import PermissionContext from '@/modules/chat/context/PermissionContext';
+ import { MarkdownWorkspaceContext } from '@/modules/chat/context/MarkdownWorkspaceContext';
+ import { TranscriptSessionContext } from '@/modules/chat/context/TranscriptSessionContext';
+ import { api } from '@/shared/api';
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ import type {
+   ChatMessage,
+   Project,
+@@ -436,7 +437,7 @@ function ChatInterface({
+         ? t('messageTypes.codex')
+         : provider === 'opencode'
+             ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
+-          : t('messageTypes.claude');
++          : getPluginProviderLabel(provider, t('messageTypes.claude'));
+ 
+   if (!selectedProject) {
+     return (
+diff --git a/src/modules/chat/composer/PermissionRequestsBanner.tsx b/src/modules/chat/composer/PermissionRequestsBanner.tsx
+index fe7b55d8..02d6e71b 100644
+--- a/src/modules/chat/composer/PermissionRequestsBanner.tsx
++++ b/src/modules/chat/composer/PermissionRequestsBanner.tsx
+@@ -17,6 +17,12 @@ import {
+ 
+ registerPermissionPanel('AskUserQuestion', AskUserQuestionPanel);
+ 
++/** The rule a non-Claude provider proposes for "Allow & remember" (`context.rememberRule`). */
++const getProviderRememberRule = (request: PendingPermissionRequest): string | null => {
++  const rule = (request.context as { rememberRule?: unknown } | undefined)?.rememberRule;
++  return typeof rule === 'string' && rule ? rule : null;
++};
++
+ type PermissionRequestsBannerProps = {
+   pendingPermissionRequests: PendingPermissionRequest[];
+   handlePermissionDecision: (
+@@ -60,16 +66,20 @@ export default function PermissionRequestsBanner({
+         }
+ 
+         const rawInput = formatToolInputForDisplay(request.input);
+-        const permissionEntry = buildClaudeToolPermissionEntry(request.toolName, rawInput);
++        // A provider can name the rule "Allow & remember" saves (in its own
++        // syntax, kept by the provider itself); otherwise it is a Claude rule.
++        const providerRule = getProviderRememberRule(request);
++        const entryFor = (item: PendingPermissionRequest) => (
++          getProviderRememberRule(item)
++          ?? buildClaudeToolPermissionEntry(item.toolName, formatToolInputForDisplay(item.input))
++        );
++        const permissionEntry = entryFor(request);
+         const settings = getClaudeSettings();
+-        const alreadyAllowed = permissionEntry ? settings.allowedTools.includes(permissionEntry) : false;
++        const alreadyAllowed = !providerRule && permissionEntry ? settings.allowedTools.includes(permissionEntry) : false;
+         const rememberLabel = alreadyAllowed ? 'Allow (saved)' : 'Allow & remember';
+         const matchingRequestIds = permissionEntry
+           ? pendingPermissionRequests
+-              .filter(
+-                (item) =>
+-                  buildClaudeToolPermissionEntry(item.toolName, formatToolInputForDisplay(item.input)) === permissionEntry,
+-              )
++              .filter((item) => entryFor(item) === permissionEntry)
+               .map((item) => item.requestId)
+           : [request.requestId];
+ 
+@@ -113,7 +123,7 @@ export default function PermissionRequestsBanner({
+               <ConfirmationAction
+                 variant="outline"
+                 onClick={() => {
+-                  if (permissionEntry && !alreadyAllowed) {
++                  if (permissionEntry && !alreadyAllowed && !providerRule) {
+                     handleGrantToolPermission({ entry: permissionEntry, toolName: request.toolName });
+                   }
+                   handlePermissionDecision(matchingRequestIds, { allow: true, rememberEntry: permissionEntry });
+diff --git a/src/modules/chat/export/buildTranscriptMarkdown.ts b/src/modules/chat/export/buildTranscriptMarkdown.ts
+index 5e4d651d..82fbc883 100644
+--- a/src/modules/chat/export/buildTranscriptMarkdown.ts
++++ b/src/modules/chat/export/buildTranscriptMarkdown.ts
+@@ -1,6 +1,7 @@
+ import type { ChatMessage, DiffLine, LLMProvider } from '@/shared/types';
+ import { getToolConfig } from '@/modules/chat/tools';
+ import { parseToolPayload, summarizeDiff } from '@/modules/chat/utils/messageTransforms';
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ 
+ type BuildTranscriptMarkdownInput = {
+   messages: ChatMessage[];
+@@ -91,7 +92,7 @@ function renderToolCall(
+  * on any Markdown host, with tool calls, diffs and thinking blocks intact.
+  */
+ export function buildTranscriptMarkdown(input: BuildTranscriptMarkdownInput): string {
+-  const providerLabel = PROVIDER_LABELS[String(input.provider)] ?? 'Assistant';
++  const providerLabel = PROVIDER_LABELS[String(input.provider)] ?? getPluginProviderLabel(String(input.provider), 'Assistant');
+   const sections: string[] = [
+     `# ${input.sessionTitle}`,
+     '',
+diff --git a/src/modules/chat/hooks/useChatProviderState.ts b/src/modules/chat/hooks/useChatProviderState.ts
+index 8a9b5345..ff1119a5 100644
+--- a/src/modules/chat/hooks/useChatProviderState.ts
++++ b/src/modules/chat/hooks/useChatProviderState.ts
+@@ -11,6 +11,7 @@ import type { PendingPermissionRequest, PermissionMode,
+   ProviderModelsDefinition } from '@/shared/types';
+ import { DEFAULT_EFFORT_VALUE } from '@/shared/constants';
+ import { readSelectedProvider, writeSelectedProvider } from '@/shared/selectedProvider';
++import { usePluginProviders, withPluginProviderIds } from '@/shared/providerRegistry';
+ 
+ const FALLBACK_PROVIDER_EFFORT_VALUES: Partial<Record<LLMProvider, readonly string[]>> = {
+   // Superset used only before the model catalog loads; `ultracode` belongs to the
+@@ -135,14 +136,14 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+   // must restore the model that provider was last used with, and the catalogue
+   // that validates them arrives asynchronously per provider.
+   const [providerModels, setProviderModels] = useState<Record<LLMProvider, string>>(() => {
+-    return PROVIDERS.reduce<Record<LLMProvider, string>>((acc, targetProvider) => {
++    return withPluginProviderIds(PROVIDERS).reduce<Record<LLMProvider, string>>((acc, targetProvider) => {
+       acc[targetProvider] = localStorage.getItem(providerModelStorageKey(targetProvider))
+-        || FALLBACK_DEFAULT_MODEL[targetProvider];
++        || (FALLBACK_DEFAULT_MODEL[targetProvider] ?? '');
+       return acc;
+     }, {} as Record<LLMProvider, string>);
+   });
+   const [providerEfforts, setProviderEfforts] = useState<Partial<Record<LLMProvider, string>>>(() => {
+-    return PROVIDERS.reduce<Partial<Record<LLMProvider, string>>>((acc, targetProvider) => {
++    return withPluginProviderIds(PROVIDERS).reduce<Partial<Record<LLMProvider, string>>>((acc, targetProvider) => {
+       acc[targetProvider] = localStorage.getItem(`${targetProvider}-effort`) || DEFAULT_EFFORT_VALUE;
+       return acc;
+     }, {});
+@@ -164,6 +165,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+   >({});
+   const [providerModelsLoading, setProviderModelsLoading] = useState(true);
+ 
++  // Built-ins plus plugin providers; grows once the plugin registry has loaded.
++  const pluginProviders = usePluginProviders();
++  const providerIds = useMemo(() => withPluginProviderIds(PROVIDERS), [pluginProviders]);
++
+   const providerModelsRequestIdRef = useRef(0);
+   const sessionSelectionLoadRequestIdRef = useRef(0);
+   const sessionModelMutationIdRef = useRef(0);
+@@ -196,7 +201,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+       // Each provider lands in the catalog as soon as it answers, so a slow
+       // one (OpenCode shells out to its CLI) cannot hold back the others.
+       await Promise.all(
+-        PROVIDERS.map(async (p) => {
++        providerIds.map(async (p) => {
+           try {
+             const response = await api.providers.models(p);
+             const body = (await response.json()) as ProviderModelsApiResponse;
+@@ -216,7 +221,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+         setProviderModelsLoading(false);
+       }
+     }
+-  }, []);
++  }, [providerIds]);
+ 
+   useEffect(() => {
+     void loadProviderModels();
+@@ -350,7 +355,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+   useEffect(() => {
+     const reconciledModels: Partial<Record<LLMProvider, string>> = {};
+ 
+-    for (const targetProvider of PROVIDERS) {
++    for (const targetProvider of providerIds) {
+       const catalog = providerModelCatalog[targetProvider];
+       if (!catalog) {
+         continue;
+@@ -371,13 +376,13 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+     if (Object.keys(reconciledModels).length > 0) {
+       setProviderModels((previous) => ({ ...previous, ...reconciledModels }));
+     }
+-  }, [providerModelCatalog, providerModels]);
++  }, [providerIds, providerModelCatalog, providerModels]);
+ 
+   useEffect(() => {
+     const nextEfforts: Partial<Record<LLMProvider, string>> = {};
+     let hasUpdates = false;
+ 
+-    for (const targetProvider of PROVIDERS) {
++    for (const targetProvider of providerIds) {
+       const currentEffort = providerEfforts[targetProvider] ?? DEFAULT_EFFORT_VALUE;
+       const nextEffort = reconcileStoredEffort(targetProvider, providerModels[targetProvider], currentEffort);
+       if (nextEffort === currentEffort) {
+@@ -392,7 +397,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+     if (hasUpdates) {
+       setProviderEfforts((previous) => ({ ...previous, ...nextEfforts }));
+     }
+-  }, [providerEfforts, providerModels, reconcileStoredEffort]);
++  }, [providerEfforts, providerIds, providerModels, reconcileStoredEffort]);
+ 
+   useEffect(() => {
+     const validModes = getPermissionModesForProvider(provider);
+diff --git a/src/modules/chat/modals/CommandResultModal.tsx b/src/modules/chat/modals/CommandResultModal.tsx
+index 00c30822..8434392b 100644
+--- a/src/modules/chat/modals/CommandResultModal.tsx
++++ b/src/modules/chat/modals/CommandResultModal.tsx
+@@ -26,6 +26,7 @@ import type {
+   ProviderModelsDefinition,CommandModalPayload,CostCommandData,HelpCommandData,ModelCommandData,StatusCommandData
+ } from '@/shared/types';
+ import ModelLibraryPanel from '@/modules/chat/modals/ModelLibraryPanel';
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ 
+ type CommandResultModalProps = {
+   payload: CommandModalPayload | null;
+@@ -73,7 +74,7 @@ const getProviderLabel = (provider: string | undefined, fallback = 'Unknown') =>
+     return fallback;
+   }
+ 
+-  return PROVIDER_LABELS[provider] || provider;
++  return PROVIDER_LABELS[provider] || getPluginProviderLabel(provider, provider);
+ };
+ 
+ const formatNumber = (value: number) => {
+diff --git a/src/modules/chat/modals/ModelLibraryPanel.tsx b/src/modules/chat/modals/ModelLibraryPanel.tsx
+index bc078a9a..d93cb32d 100644
+--- a/src/modules/chat/modals/ModelLibraryPanel.tsx
++++ b/src/modules/chat/modals/ModelLibraryPanel.tsx
+@@ -12,6 +12,7 @@ import {
+   X,
+ } from 'lucide-react';
+ 
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ import { Badge, Button, Input, LLMProviderLogo } from '@/shared/ui';
+ import type {
+   CustomProviderModelInput,
+@@ -95,7 +96,9 @@ export default function ModelLibraryPanel({
+   // providers this machine has connected (OpenCode). Empty for providers
+   // without effort support, which hides the section entirely.
+   const providerEffortLevels = providerModelCatalog[selectedProvider]?.EFFORT_LEVELS ?? [];
+-  const selectedProviderLabel = PROVIDERS.find((entry) => entry.id === selectedProvider)?.label;
++  // Plugin providers have no tab here (custom models are built-in only) but can be the initial provider.
++  const selectedProviderLabel = PROVIDERS.find((entry) => entry.id === selectedProvider)?.label
++    ?? getPluginProviderLabel(selectedProvider, selectedProvider);
+   const customModelsOnly = providerModelCatalog[selectedProvider]?.CUSTOM_MODELS_ONLY === true;
+   // The server only hides the built-ins while a custom model exists.
+   const builtInModelsHidden = customModelsOnly && customModels.length > 0;
+diff --git a/src/modules/chat/transcript/MessageComponent.tsx b/src/modules/chat/transcript/MessageComponent.tsx
+index 761f43b0..c50e5cda 100644
+--- a/src/modules/chat/transcript/MessageComponent.tsx
++++ b/src/modules/chat/transcript/MessageComponent.tsx
+@@ -16,6 +16,7 @@ import MessageModelLabel from '@/modules/chat/transcript/MessageModelLabel';
+ import MessageSpeakControl from '@/modules/chat/transcript/MessageSpeakControl';
+ import { useIsExportingTranscript } from '@/modules/chat/context/TranscriptRenderContext';
+ import { MemoryCitations } from '@/modules/chat/transcript/MemoryCitations';
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ 
+ type MessageComponentProps = {
+   message: ChatMessage;
+@@ -229,7 +230,7 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, s
+                           ? t('messageTypes.codex')
+                           : provider === 'opencode'
+                               ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
+-                              : t('messageTypes.claude'))}
++                              : getPluginProviderLabel(provider, t('messageTypes.claude')))}
+               </div>
+             </div>
+           )}
+diff --git a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
+index 28b778f0..3cf600eb 100644
+--- a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
++++ b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
+@@ -25,6 +25,7 @@ import {
+ import ModelGroupList, { type ModelGroup } from "@/modules/chat/composer/ModelGroupList";
+ import ModelLibraryPanel from "@/modules/chat/modals/ModelLibraryPanel";
+ import { writeSelectedProvider } from '@/shared/selectedProvider';
++import { getPluginProviderLabel, usePluginProviders } from '@/shared/providerRegistry';
+ 
+ const PROVIDER_META: { id: LLMProvider; name: string }[] = [
+   { id: "claude", name: "Anthropic" },
+@@ -78,7 +79,7 @@ function getProviderDisplayName(p: LLMProvider) {
+   if (p === "cursor") return "Cursor";
+   if (p === "codex") return "Codex";
+   if (p === "opencode") return "OpenCode";
+-  return "Claude";
++  return getPluginProviderLabel(p, "Claude");
+ }
+ 
+ /**
+@@ -107,6 +108,15 @@ export default function ProviderSelectionEmptyState({
+ 
+   const [modelSearch, setModelSearch] = useState("");
+ 
++  const pluginProviders = usePluginProviders();
++  const providerMeta = useMemo(
++    () => [
++      ...PROVIDER_META,
++      ...pluginProviders.map((plugin) => ({ id: plugin.id, name: plugin.description || plugin.label })),
++    ],
++    [pluginProviders],
++  );
++
+   /**
+    * Opens and closes the picker, clearing the search on the way out.
+    *
+@@ -123,13 +133,13 @@ export default function ProviderSelectionEmptyState({
+ 
+   /** One collapsible branch per provider, in the order the picker lists them. */
+   const visibleProviderGroups = useMemo<ModelGroup[]>(
+-    () => PROVIDER_META.map((meta) => ({
++    () => providerMeta.map((meta) => ({
+       key: meta.id,
+       provider: meta.id,
+       name: meta.name,
+       models: providerModelCatalog[meta.id]?.OPTIONS ?? [],
+     })),
+-    [providerModelCatalog],
++    [providerMeta, providerModelCatalog],
+   );
+ 
+   /**
+@@ -138,13 +148,13 @@ export default function ProviderSelectionEmptyState({
+    * rather than promising built-in models there.
+    */
+   const customOnlyGroupNames = useMemo(
+-    () => PROVIDER_META
++    () => providerMeta
+       .filter((meta) => {
+         const catalog = providerModelCatalog[meta.id];
+         return catalog?.CUSTOM_MODELS_ONLY === true && catalog.OPTIONS.some((option) => option.isCustom);
+       })
+       .map((meta) => meta.name),
+-    [providerModelCatalog],
++    [providerMeta, providerModelCatalog],
+   );
+ 
+   const nextTaskPrompt = t("tasks.nextTaskPrompt", {
+@@ -329,7 +339,12 @@ export default function ProviderSelectionEmptyState({
+                   model: providerModels.opencode,
+                   defaultValue: "Ready with OpenCode {{model}}",
+                 }),
+-              }[provider]
++              }[provider as string]
++              ?? t("providerSelection.readyPrompt.plugin", {
++                provider: getProviderDisplayName(provider),
++                model: currentModelLabel,
++                defaultValue: "Ready with {{provider}} {{model}}",
++              })
+             }
+           </p>
+ 
+diff --git a/src/modules/mcp/McpServers.tsx b/src/modules/mcp/McpServers.tsx
+index e920820e..a9d1d78b 100644
+--- a/src/modules/mcp/McpServers.tsx
++++ b/src/modules/mcp/McpServers.tsx
+@@ -147,7 +147,7 @@ export default function McpServers({ selectedProvider, currentProjects }: McpSer
+           label={t('mcpServersAdd.menuLabel')}
+           icon={Plus}
+           className="w-full sm:w-auto"
+-          triggerClassName={`w-full sm:w-auto ${MCP_PROVIDER_BUTTON_CLASSES[selectedProvider]}`}
++          triggerClassName={`w-full sm:w-auto ${MCP_PROVIDER_BUTTON_CLASSES[selectedProvider] ?? MCP_PROVIDER_BUTTON_CLASSES.claude}`}
+           items={[
+             {
+               key: 'global',
+diff --git a/src/modules/plugins/PluginIcon.tsx b/src/modules/plugins/PluginIcon.tsx
+index 1f175f89..c33518f6 100644
+--- a/src/modules/plugins/PluginIcon.tsx
++++ b/src/modules/plugins/PluginIcon.tsx
+@@ -1,4 +1,4 @@
+-import { useState, useEffect } from 'react';
++import { useState, useEffect, useId, useMemo } from 'react';
+ import DOMPurify from 'dompurify';
+ 
+ import { api } from '@/shared/api';
+@@ -54,6 +54,18 @@ function sanitizeSvg(svgText: string): string | null {
+   }
+ }
+ 
++/**
++ * Suffixes every id in the SVG, and every `url(#id)` reference to one, with
++ * `scope`. The same icon is often inlined several times on one page; with
++ * shared ids each copy's masks and filters resolve to the first copy, which
++ * breaks rendering when that copy is hidden.
++ */
++function scopeSvgIds(svg: string, scope: string): string {
++  return svg
++    .replace(/\bid="([^"]+)"/g, (_match, id: string) => `id="${id}-${scope}"`)
++    .replace(/url\(#([^)]+)\)/g, (_match, id: string) => `url(#${id}-${scope})`);
++}
++
+ /** Used by the project-workspace module's tab bar and by this module's PluginSettingsTab to show a plugin's icon. */
+ export default function PluginIcon({ pluginName, iconFile, className }: Props) {
+   const url = iconFile ? api.plugins.assetUrl(pluginName, iconFile) : '';
+@@ -77,9 +89,12 @@ export default function PluginIcon({ pluginName, iconFile, className }: Props) {
+       .catch(() => {});
+   }, [url, pluginName, iconFile]);
+ 
+-  if (!svg) return <span className={className} />;
++  const scope = useId().replace(/[^a-zA-Z0-9_-]/g, '');
++  const scopedSvg = useMemo(() => (svg ? scopeSvgIds(svg, scope) : null), [svg, scope]);
++
++  if (!scopedSvg) return <span className={className} />;
+ 
+   return (
+-    <span className={className} dangerouslySetInnerHTML={{ __html: svg }} />
++    <span className={className} dangerouslySetInnerHTML={{ __html: scopedSvg }} />
+   );
+ }
+diff --git a/src/modules/project-workspace/WorkspaceTabs.tsx b/src/modules/project-workspace/WorkspaceTabs.tsx
+index 6e4c290a..ad4a756b 100644
+--- a/src/modules/project-workspace/WorkspaceTabs.tsx
++++ b/src/modules/project-workspace/WorkspaceTabs.tsx
+@@ -69,7 +69,8 @@ export default function WorkspaceTabs({
+   ];
+ 
+   const pluginTabs: PluginTab[] = plugins
+-    .filter((p) => p.enabled)
++    // Provider plugins add a chat provider, not a tab.
++    .filter((p) => p.enabled && (p.slot ?? 'tab') === 'tab')
+     .map((p) => ({
+       kind: 'plugin',
+       id: `plugin:${p.name}` as AppTab,
+diff --git a/src/modules/provider-auth/ProviderLoginModal.tsx b/src/modules/provider-auth/ProviderLoginModal.tsx
+index 7d8186f1..9f61c39e 100644
+--- a/src/modules/provider-auth/ProviderLoginModal.tsx
++++ b/src/modules/provider-auth/ProviderLoginModal.tsx
+@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
+ import { X } from 'lucide-react';
+ 
+ import { StandaloneShell } from '@/modules/standalone-shell';
++import { getPluginProvider } from '@/shared/providerRegistry';
+ import { IS_PLATFORM } from '@/shared/utils';
+ import type { LLMProvider } from '@/shared/types';
+ 
+@@ -59,6 +60,11 @@ const getProviderCommand = ({
+     return 'opencode auth login';
+   }
+ 
++  const pluginLoginCommand = getPluginProvider(provider)?.loginCommand;
++  if (pluginLoginCommand) {
++    return pluginLoginCommand;
++  }
++
+   return 'claude --dangerously-skip-permissions /login';
+ };
+ 
+@@ -67,6 +73,8 @@ const getProviderTitle = (provider: LLMProvider) => {
+   if (provider === 'cursor') return 'Cursor CLI Login';
+   if (provider === 'codex') return 'Codex CLI Login';
+   if (provider === 'opencode') return 'OpenCode CLI Login';
++  const pluginLabel = getPluginProvider(provider)?.label;
++  if (pluginLabel) return `${pluginLabel} CLI Login`;
+   return 'Claude CLI Login';
+ };
+ 
+diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
+index 505f0d15..3cd211fc 100644
+--- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
++++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
+@@ -1,6 +1,7 @@
+ import { useCallback, useState } from 'react';
+ 
+ import { api } from '@/shared/api';
++import { withPluginProviderIds } from '@/shared/providerRegistry';
+ import type {
+   LLMProvider,
+   ProviderAuthStatus,
+@@ -121,7 +122,7 @@ export function useProviderAuthStatus(
+     }
+   }, [setProviderLoading, setProviderStatus]);
+ 
+-  const refreshProviderAuthStatuses = useCallback(async (providers: LLMProvider[] = CLI_PROVIDERS) => {
++  const refreshProviderAuthStatuses = useCallback(async (providers: LLMProvider[] = withPluginProviderIds(CLI_PROVIDERS)) => {
+     await Promise.all(providers.map((provider) => checkProviderAuthStatus(provider)));
+   }, [checkProviderAuthStatus]);
+ 
+diff --git a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx b/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
+index e9d2afb7..f0ddda90 100644
+--- a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
++++ b/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
+@@ -4,6 +4,7 @@ import type { AgentCategory, AgentContextByProvider, AgentProvider, AgentSetting
+ import AgentCategoryContentSection from '@/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection';
+ import AgentCategoryTabsSection from '@/modules/settings/tabs/agents-settings/sections/AgentCategoryTabsSection';
+ import AgentSelectorSection from '@/modules/settings/tabs/agents-settings/sections/AgentSelectorSection';
++import { usePluginProviders, withPluginProviderIds } from '@/shared/providerRegistry';
+ 
+ type ProviderAuthStatusByProvider = Record<AgentProvider, ProviderAuthStatus>;
+ 
+@@ -33,15 +34,27 @@ export default function AgentsSettingsTab({
+ }: AgentsSettingsTabProps) {
+   const [selectedAgent, setSelectedAgent] = useState<AgentProvider>('claude');
+   const [selectedCategory, setSelectedCategory] = useState<AgentCategory>('account');
+-  const visibleCategories = useMemo<AgentCategory[]>(() => (
+-    selectedAgent === 'opencode'
++  const pluginProviders = usePluginProviders();
++  const visibleCategories = useMemo<AgentCategory[]>(() => {
++    // Plugin providers show only the panels their capabilities declare.
++    const pluginProvider = pluginProviders.find((plugin) => plugin.id === selectedAgent);
++    if (pluginProvider) {
++      return [
++        'account',
++        ...(pluginProvider.settingsPanel ? ['permissions' as const] : []),
++        ...(pluginProvider.capabilities.supportsMcp ? ['mcp' as const] : []),
++        ...(pluginProvider.capabilities.supportsSkills ? ['skills' as const] : []),
++      ];
++    }
++
++    return selectedAgent === 'opencode'
+       ? ['account', 'permissions', 'mcp']
+-      : ['account', 'permissions', 'mcp', 'skills']
+-  ), [selectedAgent]);
++      : ['account', 'permissions', 'mcp', 'skills'];
++  }, [pluginProviders, selectedAgent]);
+ 
+   const visibleAgents = useMemo<AgentProvider[]>(() => {
+-    return ['claude', 'cursor', 'codex', 'opencode'];
+-  }, []);
++    return withPluginProviderIds(['claude', 'cursor', 'codex', 'opencode']);
++  }, [pluginProviders]);
+ 
+   const agentContextById = useMemo<AgentContextByProvider>(() => ({
+     claude: {
+@@ -60,12 +73,15 @@ export default function AgentsSettingsTab({
+       authStatus: providerAuthStatus.opencode,
+       onLogin: () => onProviderLogin('opencode'),
+     },
++    ...Object.fromEntries(pluginProviders.map((plugin) => [plugin.id, {
++      authStatus: providerAuthStatus[plugin.id]
++        ?? { authenticated: false, email: null, method: null, error: null, loading: true },
++      onLogin: () => onProviderLogin(plugin.id),
++    }])),
+   }), [
+     onProviderLogin,
+-    providerAuthStatus.claude,
+-    providerAuthStatus.codex,
+-    providerAuthStatus.cursor,
+-    providerAuthStatus.opencode,
++    pluginProviders,
++    providerAuthStatus,
+   ]);
+ 
+   useEffect(() => {
+diff --git a/src/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection.tsx b/src/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection.tsx
+index 73111b60..f1added6 100644
+--- a/src/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection.tsx
++++ b/src/modules/settings/tabs/agents-settings/sections/AgentCategoryContentSection.tsx
+@@ -3,6 +3,8 @@ import { McpServers } from '@/modules/mcp';
+ import { ProviderSkills } from '@/modules/skills';
+ import AccountContent from '@/modules/settings/tabs/agents-settings/sections/content/AccountContent';
+ import PermissionsContent from '@/modules/settings/tabs/agents-settings/sections/content/PermissionsContent';
++import { PluginTabContent } from '@/modules/plugins';
++import { getPluginProvider } from '@/shared/providerRegistry';
+ 
+ type AgentCategoryContentSectionProps = {
+   selectedAgent: AgentProvider;
+@@ -30,8 +32,15 @@ export default function AgentCategoryContentSection({
+   onCodexPermissionModeChange,
+   projects,
+ }: AgentCategoryContentSectionProps) {
++  const pluginProvider = getPluginProvider(selectedAgent);
++
+   return (
+     <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden p-3 md:p-4">
++      {/* A provider plugin's own settings UI (its manifest `entry`), mounted like a tab plugin. */}
++      {selectedCategory === 'permissions' && pluginProvider?.settingsPanel && (
++        <PluginTabContent pluginName={pluginProvider.pluginName} selectedProject={null} selectedSession={null} />
++      )}
++
+       {selectedCategory === 'account' && (
+         <AccountContent
+           agent={selectedAgent}
+diff --git a/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx b/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
+index 079a067f..3d7ca2b6 100644
+--- a/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
++++ b/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
+@@ -1,3 +1,4 @@
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
+ import { LLMProviderLogo, PillBar, Pill } from '@/shared/ui';
+ import type { AgentContextByProvider, AgentProvider } from '@/shared/types';
+ 
+@@ -39,8 +40,8 @@ export default function AgentSelectorSection({
+               className="min-w-0 flex-1 justify-center md:flex-initial"
+             >
+               <LLMProviderLogo provider={agent} className="h-4 w-4 flex-shrink-0" />
+-              <span className="truncate">{AGENT_NAMES[agent]}</span>
+-              {agentContextById[agent].authStatus.authenticated && (
++              <span className="truncate">{AGENT_NAMES[agent] ?? getPluginProviderLabel(agent, agent)}</span>
++              {agentContextById[agent]?.authStatus.authenticated && (
+                 <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${dotColor}`} />
+               )}
+             </Pill>
+diff --git a/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx b/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
+index 8b5d7cde..ba9598c5 100644
+--- a/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
++++ b/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
+@@ -2,6 +2,7 @@ import { AlertTriangle, LogIn } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ 
+ import ProviderCliVersion from '@/modules/settings/tabs/agents-settings/sections/content/ProviderCliVersion';
++import { getPluginProvider } from '@/shared/providerRegistry';
+ import { Badge, Button, LLMProviderLogo } from '@/shared/ui';
+ import type { AgentProvider, ProviderAuthStatus, ProviderAuthSubscriptionOverride } from '@/shared/types';
+ 
+@@ -98,7 +99,12 @@ function SubscriptionOverrideNotice({ override }: SubscriptionOverrideNoticeProp
+ /** Rendered by AgentCategoryContentSection for the "account" category to show sign-in state for one provider. */
+ export default function AccountContent({ agent, authStatus, onLogin }: AccountContentProps) {
+   const { t } = useTranslation('settings');
+-  const config = agentConfig[agent];
++  const pluginProvider = getPluginProvider(agent);
++  const config = agentConfig[agent] ?? {
++    ...agentConfig.codex,
++    name: pluginProvider?.label ?? agent,
++    description: pluginProvider?.description || undefined,
++  };
+ 
+   return (
+     <div className="space-y-6">
+diff --git a/src/modules/sidebar/SessionOptions.tsx b/src/modules/sidebar/SessionOptions.tsx
+index 1f7b254c..427c5cc5 100644
+--- a/src/modules/sidebar/SessionOptions.tsx
++++ b/src/modules/sidebar/SessionOptions.tsx
+@@ -7,7 +7,7 @@ import { cn } from '@/shared/utils';
+ import type { LLMProvider } from '@/shared/types';
+ import { useSessionForkingProviders } from '@/shared/hooks/useProviderCapabilities';
+ import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
+-import { PROVIDER_LABELS } from '@/modules/sidebar/utils/sidebarProjectFormatting';
++import { getSidebarProviderLabel } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+ 
+ type SessionOptionsProps = {
+   sessionId: string;
+@@ -63,7 +63,7 @@ export default function SessionOptions({
+   t,
+ }: SessionOptionsProps) {
+   const containerRef = useRef<HTMLDivElement>(null);
+-  const providerLabel = PROVIDER_LABELS[provider];
++  const providerLabel = getSidebarProviderLabel(provider);
+   const { copyState, copyLabel, setOptionsOpen, handleCopyAction, isCopyPending, CopyStateIcon } =
+     useProviderSessionIdCopy(sessionId, providerLabel);
+ 
+diff --git a/src/modules/sidebar/SidebarSessionItem.tsx b/src/modules/sidebar/SidebarSessionItem.tsx
+index c5b3b3a7..f7f7dc02 100644
+--- a/src/modules/sidebar/SidebarSessionItem.tsx
++++ b/src/modules/sidebar/SidebarSessionItem.tsx
+@@ -6,7 +6,7 @@ import type { TFunction } from 'i18next';
+ import { Badge, Dialog, DialogContent, DialogTitle, LLMProviderLogo, Tooltip, buttonVariants } from '@/shared/ui';
+ import { cn } from '@/shared/utils';
+ import type { LLMProvider, Project, ProjectSession, SessionWithProvider } from '@/shared/types';
+-import { PROVIDER_LABELS, createSessionViewModel, formatCompactAge } from '@/modules/sidebar/utils/sidebarProjectFormatting';
++import { createSessionViewModel, formatCompactAge, getSidebarProviderLabel } from '@/modules/sidebar/utils/sidebarProjectFormatting';
+ import { useCompactSidebar } from '@/modules/sidebar/hooks/useCompactSidebar';
+ import { useProviderSessionIdCopy } from '@/modules/sidebar/hooks/useProviderSessionIdCopy';
+ import SessionOptions from '@/modules/sidebar/SessionOptions';
+@@ -80,7 +80,7 @@ function SidebarSessionItem({
+     : showBackgroundIndicator
+       ? t('tooltips.backgroundWorkIndicator', { defaultValue: 'Background work running' })
+       : t('tooltips.activeSessionIndicator');
+-  const providerLabel = PROVIDER_LABELS[session.__provider];
++  const providerLabel = getSidebarProviderLabel(session.__provider);
+ 
+   // The desktop controls live in SessionOptions, which owns the rename panel and
+   // its outside-click dismissal. The mobile rename sits inside the bottom sheet,
+diff --git a/src/modules/sidebar/utils/sidebarProjectFormatting.ts b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+index e72924ed..a0ef3222 100644
+--- a/src/modules/sidebar/utils/sidebarProjectFormatting.ts
++++ b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+@@ -1,5 +1,7 @@
+ import type { TFunction } from 'i18next';
+ 
++import { getPluginProviderLabel } from '@/shared/providerRegistry';
++
+ import type {
+   LLMProvider,
+   Project,
+@@ -215,3 +217,8 @@ export const PROVIDER_LABELS: Record<LLMProvider, string> = {
+   cursor: 'Cursor',
+   opencode: 'OpenCode',
+ };
++
++/** PROVIDER_LABELS plus providers loaded from plugins. */
++export const getSidebarProviderLabel = (provider: LLMProvider): string => (
++  PROVIDER_LABELS[provider] ?? getPluginProviderLabel(provider, provider)
++);
+diff --git a/src/modules/skills/ProviderSkills.tsx b/src/modules/skills/ProviderSkills.tsx
+index 97459267..69424a31 100644
+--- a/src/modules/skills/ProviderSkills.tsx
++++ b/src/modules/skills/ProviderSkills.tsx
+@@ -25,6 +25,7 @@ import {
+   Input,
+ } from '@/shared/ui';
+ import { useProviderSkills } from '@/modules/skills/hooks/useProviderSkills';
++import { getPluginProvider, getPluginProviderLabel } from '@/shared/providerRegistry';
+ import type { ProviderSkill, ProviderSkillCreateEntryPayload, SkillsProject, SkillsProvider, SkillsScope } from '@/shared/types';
+ 
+ type ProviderSkillsProps = {
+@@ -205,8 +206,10 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
+   const fileInputRef = useRef<HTMLInputElement>(null);
+   const folderInputRef = useRef<HTMLInputElement | null>(null);
+ 
+-  const providerName = PROVIDER_NAMES[selectedProvider];
+-  const providerPath = selectedProvider === 'opencode' ? null : PROVIDER_SKILL_PATHS[selectedProvider];
++  const providerName = PROVIDER_NAMES[selectedProvider] ?? getPluginProviderLabel(selectedProvider, selectedProvider);
++  const providerPath = selectedProvider === 'opencode'
++    ? null
++    : PROVIDER_SKILL_PATHS[selectedProvider] ?? (getPluginProvider(selectedProvider)?.capabilities.skillsPath as string | undefined) ?? null;
+ 
+   useEffect(() => {
+     setQueuedFiles([]);
+diff --git a/src/shared/api.ts b/src/shared/api.ts
+index 7c91a8dc..23583c13 100644
+--- a/src/shared/api.ts
++++ b/src/shared/api.ts
+@@ -417,6 +417,7 @@ export const api = {
+   // Provider (coding agent) endpoints — models, capabilities, sessions, MCP, skills.
+   providers: {
+     capabilities: () => get('/api/providers/capabilities'),
++    registry: () => get('/api/providers/registry'),
+     authStatus: (provider: string) =>
+       get(`/api/providers/${encodeURIComponent(provider)}/auth/status`),
+     cliStatus: (provider: string) =>
+diff --git a/src/shared/constants.ts b/src/shared/constants.ts
+index 7c485fa4..a0a4a847 100644
+--- a/src/shared/constants.ts
++++ b/src/shared/constants.ts
+@@ -11,6 +11,7 @@ import {
+ } from 'lucide-react';
+ import type { ComponentType } from 'react';
+ 
++import { getPluginProvider } from '@/shared/providerRegistry';
+ import type { FileStatusCode, LLMProvider, McpProvider, McpScope, McpTransport, SettingsMainTab } from '@/shared/types';
+ import type { UserPreferenceKey } from '@/shared/userSettings';
+ 
+@@ -114,40 +115,55 @@ export const FILE_STATUS_GROUPS: GitStatusGroupEntry[] = [
+ 
+ //----------------- MCP SERVER CAPABILITIES ------------
+ 
++/**
++ * Answers lookups for plugin provider ids (outside McpProvider) with
++ * `fallback`, so the MCP maps below never return undefined for them.
++ */
++const withPluginProviderFallback = <T,>(
++  builtins: Record<McpProvider, T>,
++  fallback: (provider: string) => T,
++): Record<McpProvider, T> => new Proxy(builtins, {
++  get: (target, key, receiver) => (
++    typeof key === 'string' && !Object.prototype.hasOwnProperty.call(target, key) && getPluginProvider(key)
++      ? fallback(key)
++      : Reflect.get(target, key, receiver)
++  ),
++});
++
+ /** Display name for each provider that can host MCP servers, used in headings and buttons. */
+-export const MCP_PROVIDER_NAMES: Record<McpProvider, string> = {
++export const MCP_PROVIDER_NAMES: Record<McpProvider, string> = withPluginProviderFallback({
+   claude: 'Claude',
+   cursor: 'Cursor',
+   codex: 'Codex',
+   opencode: 'OpenCode',
+-};
++}, (provider) => getPluginProvider(provider)?.label ?? provider);
+ 
+ /** Scopes each provider can install an MCP server into; drives the scope selector and validation. */
+-export const MCP_SUPPORTED_SCOPES: Record<McpProvider, McpScope[]> = {
++export const MCP_SUPPORTED_SCOPES: Record<McpProvider, McpScope[]> = withPluginProviderFallback({
+   claude: ['user', 'project', 'local'],
+   cursor: ['user', 'project'],
+   codex: ['user', 'project'],
+   opencode: ['user', 'project'],
+-};
++}, () => ['user']);
+ 
+ /** Transports each provider can talk to an MCP server over; drives the transport selector and validation. */
+-export const MCP_SUPPORTED_TRANSPORTS: Record<McpProvider, McpTransport[]> = {
++export const MCP_SUPPORTED_TRANSPORTS: Record<McpProvider, McpTransport[]> = withPluginProviderFallback({
+   claude: ['stdio', 'http', 'sse'],
+   cursor: ['stdio', 'http'],
+   codex: ['stdio', 'http'],
+   opencode: ['stdio', 'http'],
+-};
++}, () => ['stdio', 'http']);
+ 
+ /** Transports offered when configuring a global (provider-agnostic) MCP server. */
+ export const MCP_GLOBAL_SUPPORTED_TRANSPORTS: McpTransport[] = ['stdio', 'http'];
+ 
+ /** Whether a provider honours an MCP server's working-directory setting; the form hides the field when it does not. */
+-export const MCP_SUPPORTS_WORKING_DIRECTORY: Record<McpProvider, boolean> = {
++export const MCP_SUPPORTS_WORKING_DIRECTORY: Record<McpProvider, boolean> = withPluginProviderFallback({
+   claude: false,
+   cursor: false,
+   codex: true,
+   opencode: false,
+-};
++}, () => false);
+ 
+ // ---------------------------
+ 
+diff --git a/src/shared/providerRegistry.ts b/src/shared/providerRegistry.ts
+new file mode 100644
+index 00000000..7f55e699
+--- /dev/null
++++ b/src/shared/providerRegistry.ts
+@@ -0,0 +1,116 @@
++import { useEffect, useSyncExternalStore } from 'react';
++
++import { api } from '@/shared/api';
++import type { LLMProvider } from '@/shared/types';
++
++/**
++ * Chat providers loaded from plugins (`slot: "provider"`), as reported by
++ * `GET /api/providers/registry`.
++ *
++ * The four built-in providers stay hard-coded throughout the UI. Plugin
++ * providers are appended to those lists through the helpers below, and every
++ * per-provider lookup table falls back to this metadata for ids it does not
++ * know. Plugin ids are outside the LLMProvider union, so they are cast at
++ * this boundary.
++ */
++export type PluginProviderInfo = {
++  id: LLMProvider;
++  pluginName: string;
++  pluginIcon: string | null;
++  label: string;
++  description: string;
++  loginCommand: string | null;
++  capabilities: {
++    permissionModes?: string[];
++    supportsMcp?: boolean;
++    supportsSkills?: boolean;
++    [key: string]: unknown;
++  };
++  /** The plugin ships its own settings UI, shown as this provider's Permissions panel. */
++  settingsPanel?: boolean;
++};
++
++const CACHE_KEY = 'cloudcli.pluginProviders';
++
++const readCache = (): PluginProviderInfo[] => {
++  try {
++    const cached = JSON.parse(window.localStorage.getItem(CACHE_KEY) ?? '[]');
++    return Array.isArray(cached) ? cached : [];
++  } catch {
++    return [];
++  }
++};
++
++// Seeded from the last load so synchronous readers (the stored provider
++// choice) accept a plugin id before the request below has answered.
++let pluginProviders: PluginProviderInfo[] = typeof window === 'undefined' ? [] : readCache();
++let loadRequest: Promise<void> | null = null;
++const listeners = new Set<() => void>();
++
++export function loadPluginProviders(): Promise<void> {
++  if (loadRequest) {
++    return loadRequest;
++  }
++
++  loadRequest = (async () => {
++    try {
++      const response = await api.providers.registry();
++      const body = (await response.json()) as { success?: boolean; data?: { providers?: PluginProviderInfo[] } };
++      if (!body.success || !Array.isArray(body.data?.providers)) {
++        return;
++      }
++
++      pluginProviders = body.data.providers;
++      try {
++        window.localStorage.setItem(CACHE_KEY, JSON.stringify(pluginProviders));
++      } catch {
++        // Storage unavailable: the in-memory list still works for this tab.
++      }
++      listeners.forEach((listener) => listener());
++    } catch (error) {
++      // A failed load leaves the cached list in place; retried on next use.
++      console.error('Error loading plugin providers:', error);
++      loadRequest = null;
++    }
++  })();
++
++  return loadRequest;
++}
++
++const subscribe = (listener: () => void) => {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++};
++
++const getSnapshot = () => pluginProviders;
++
++export function getPluginProviders(): PluginProviderInfo[] {
++  return pluginProviders;
++}
++
++export function getPluginProvider(id: string | null | undefined): PluginProviderInfo | undefined {
++  return id ? pluginProviders.find((provider) => provider.id === id) : undefined;
++}
++
++/** Built-in ids followed by the plugin provider ids. */
++export function withPluginProviderIds(builtins: readonly LLMProvider[]): LLMProvider[] {
++  return [...builtins, ...pluginProviders.map((provider) => provider.id).filter((id) => !builtins.includes(id))];
++}
++
++/** Label for a plugin provider id, or `fallback` for anything else. */
++export function getPluginProviderLabel<T extends string | undefined>(id: string | null | undefined, fallback: T): string | T {
++  return getPluginProvider(id)?.label ?? fallback;
++}
++
++/** Re-renders when the plugin provider list changes; triggers the first load. */
++export function usePluginProviders(): PluginProviderInfo[] {
++  const providers = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
++
++  useEffect(() => {
++    void loadPluginProviders();
++  }, []);
++
++  return providers;
++}
+diff --git a/src/shared/selectedProvider.ts b/src/shared/selectedProvider.ts
+index 222f8607..35b8f4e6 100644
+--- a/src/shared/selectedProvider.ts
++++ b/src/shared/selectedProvider.ts
+@@ -1,3 +1,4 @@
++import { getPluginProvider } from '@/shared/providerRegistry';
+ import type { LLMProvider } from '@/shared/types';
+ import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
+ 
+@@ -22,7 +23,9 @@ const DEFAULT_PROVIDER: LLMProvider = 'claude';
+ 
+ export function readSelectedProvider(): LLMProvider {
+   const stored = readUserPreference<string | null>('selectedProvider', null);
+-  return PROVIDERS.includes(stored as LLMProvider) ? (stored as LLMProvider) : DEFAULT_PROVIDER;
++  return PROVIDERS.includes(stored as LLMProvider) || getPluginProvider(stored)
++    ? (stored as LLMProvider)
++    : DEFAULT_PROVIDER;
+ }
+ 
+ export function writeSelectedProvider(provider: LLMProvider): void {
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 6058d70e..a4630448 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -1241,7 +1241,7 @@ export type Plugin = {
+   author: string;
+   icon: string;
+   type: 'react' | 'module';
+-  slot: 'tab';
++  slot: 'tab' | 'provider';
+   entry: string;
+   server: string | null;
+   permissions: string[];
+diff --git a/src/shared/ui/LLMProviderLogo.tsx b/src/shared/ui/LLMProviderLogo.tsx
+index 16bbc489..ec2102a9 100644
+--- a/src/shared/ui/LLMProviderLogo.tsx
++++ b/src/shared/ui/LLMProviderLogo.tsx
+@@ -1,3 +1,5 @@
++import { PluginIcon } from '@/modules/plugins';
++import { getPluginProvider } from '@/shared/providerRegistry';
+ import type { LLMProvider } from '@/shared/types';
+ import ClaudeLogo from '@/shared/ui/ClaudeLogo';
+ import CodexLogo from '@/shared/ui/CodexLogo';
+@@ -26,5 +28,16 @@ export function LLMProviderLogo({
+     return <OpenCodeLogo className={className} />;
+   }
+ 
++  const pluginProvider = getPluginProvider(provider);
++  if (pluginProvider?.pluginIcon) {
++    return (
++      <PluginIcon
++        pluginName={pluginProvider.pluginName}
++        iconFile={pluginProvider.pluginIcon}
++        className={`inline-flex [&>svg]:h-full [&>svg]:w-full ${className}`}
++      />
++    );
++  }
++
+   return <ClaudeLogo className={className} />;
+ }
+
+diff --git a/src/modules/chat/hooks/useChatProviderState.ts b/src/modules/chat/hooks/useChatProviderState.ts
+--- a/src/modules/chat/hooks/useChatProviderState.ts
++++ b/src/modules/chat/hooks/useChatProviderState.ts
+@@ -57,6 +57,7 @@
+ type ProviderCapabilities = {
+   provider: LLMProvider;
+   permissionModes: string[];
++  permissionModeOptions?: Record<string, { label: string; description: string }>;
+   defaultPermissionMode: string;
+   supportsImages: boolean;
+   supportsFiles: boolean;
+@@ -832,6 +833,7 @@
+     pendingPermissionRequests,
+     setPendingPermissionRequests,
+     availablePermissionModes,
++    permissionModeOptions: providerCapabilities?.[provider]?.permissionModeOptions,
+     selectPermissionMode,
+     cyclePermissionMode,
+     providerModelCatalog,
+diff --git a/src/modules/chat/ChatInterface.tsx b/src/modules/chat/ChatInterface.tsx
+--- a/src/modules/chat/ChatInterface.tsx
++++ b/src/modules/chat/ChatInterface.tsx
+@@ -115,6 +115,7 @@
+     pendingPermissionRequests,
+     setPendingPermissionRequests,
+     availablePermissionModes,
++    permissionModeOptions,
+     selectPermissionMode,
+     cyclePermissionMode,
+     providerModelCatalog,
+@@ -543,6 +544,7 @@
+           onAbortSession={handleAbortSession}
+           permissionMode={permissionMode}
+           availablePermissionModes={availablePermissionModes}
++          permissionModeOptions={permissionModeOptions}
+           onSelectPermissionMode={selectPermissionMode}
+           providerLabel={selectedProviderLabel}
+           effort={currentProviderEffort}
+diff --git a/src/modules/chat/composer/ChatComposer.tsx b/src/modules/chat/composer/ChatComposer.tsx
+--- a/src/modules/chat/composer/ChatComposer.tsx
++++ b/src/modules/chat/composer/ChatComposer.tsx
+@@ -36,7 +36,7 @@
+ import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
+ import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
+ import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
+-import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
++import ComposerPermissionMenu, { type PermissionModeOptions } from '@/modules/chat/composer/ComposerPermissionMenu';
+ 
+ type MentionableFile = {
+   name: string;
+@@ -55,6 +55,7 @@
+   onAbortSession: () => void;
+   permissionMode: PermissionMode;
+   availablePermissionModes: PermissionMode[];
++  permissionModeOptions?: PermissionModeOptions;
+   onSelectPermissionMode: (mode: PermissionMode) => void;
+   providerLabel: string;
+   effort: string;
+@@ -132,6 +133,7 @@
+   onAbortSession,
+   permissionMode,
+   availablePermissionModes,
++  permissionModeOptions,
+   onSelectPermissionMode,
+   providerLabel,
+   effort,
+@@ -501,6 +503,7 @@
+             <ComposerPermissionMenu
+               permissionMode={permissionMode}
+               permissionModes={availablePermissionModes}
++              permissionModeOptions={permissionModeOptions}
+               onSelectPermissionMode={onSelectPermissionMode}
+               providerLabel={providerLabel}
+             />
+diff --git a/src/modules/chat/composer/ComposerPermissionMenu.tsx b/src/modules/chat/composer/ComposerPermissionMenu.tsx
+--- a/src/modules/chat/composer/ComposerPermissionMenu.tsx
++++ b/src/modules/chat/composer/ComposerPermissionMenu.tsx
+@@ -78,10 +78,13 @@
+ const getAppearance = (mode: PermissionMode | string): ModeAppearance =>
+   MODE_APPEARANCE[mode as PermissionMode] ?? UNKNOWN_MODE;
+ 
++export type PermissionModeOptions = Record<string, { label: string; description: string }>;
++
+ type ComposerPermissionMenuProps = {
+   permissionMode: PermissionMode;
+   /** Modes the active provider supports, in the order the backend reports them. */
+   permissionModes: PermissionMode[];
++  permissionModeOptions?: PermissionModeOptions;
+   onSelectPermissionMode: (mode: PermissionMode) => void;
+   providerLabel: string;
+ };
+@@ -93,6 +96,7 @@
+ function ComposerPermissionMenu({
+   permissionMode,
+   permissionModes,
++  permissionModeOptions,
+   onSelectPermissionMode,
+   providerLabel,
+ }: ComposerPermissionMenuProps) {
+@@ -101,7 +105,7 @@
+   const close = useCallback(() => setIsOpen(false), []);
+   const { triggerRef, menuRef, anchor, updateAnchor } = useComposerMenuAnchor(isOpen, close, 22 * 16);
+   const modeLabel = (mode: PermissionMode) =>
+-    t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
++    permissionModeOptions?.[mode]?.label ?? t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
+   const activeModeLabel = modeLabel(permissionMode);
+   // The name is shown only where the composer has room for it, so it never
+   // pushes the model menu and the send button onto a second row. Plan mode,
+@@ -161,7 +165,7 @@
+                 key={mode}
+                 icon={<ModeIcon className="h-4 w-4" />}
+                 label={modeLabel(mode)}
+-                description={t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined}
++                description={permissionModeOptions?.[mode]?.description ?? (t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined)}
+                 isSelected={mode === permissionMode}
+                 onSelect={() => {
+                   onSelectPermissionMode(mode);

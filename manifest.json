@@ -1,0 +1,14 @@
+{
+  "name": "antigravity",
+  "displayName": "Antigravity",
+  "version": "0.1.0",
+  "description": "Google Antigravity (agy CLI) as a chat provider: chat, resume, history, models, MCP and skills.",
+  "author": "stignarnia",
+  "icon": "icon.svg",
+  "type": "module",
+  "slot": "provider",
+  "entry": "dist/settings-panel.js",
+  "server": "dist/settings-server.js",
+  "provider": "dist/provider.js",
+  "permissions": []
+}
