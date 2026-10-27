@@ -27,8 +27,9 @@ const STEP_USER_INPUT = 14;
 const STEP_AGENT = 15;
 const STEP_TOOL = 132;
 
-/** `steps.status` of a finished step; tools agy auto-denied are left at 6. */
+/** Final status codes observed in agy's steps table. */
 const STATUS_DONE = 3;
+const STATUS_NOT_RUN = 6;
 
 type StepRow = { idx: number; step_type: number; status?: number; step_payload: Uint8Array | null };
 
@@ -77,7 +78,12 @@ export function decodeStep(row: StepRow): AgyStep | null {
       name,
       args: view.string('5.4.3') ?? '{}',
       output: view.string('140.2.1') ?? null,
-      denied: view.string('5.34.4') === 'deny' || (row.status !== undefined && row.status !== STATUS_DONE),
+      // A non-DONE status can mean the tool is still running. Treating every
+      // non-DONE row as denied made accepted calls appear refused until the
+      // turn finished and agy changed their status to DONE. Status 6 is the
+      // persisted auto-denied/not-run state; an explicit permission decision
+      // is authoritative when present.
+      denied: view.string('5.34.4') === 'deny' || row.status === STATUS_NOT_RUN,
     };
   }
 
