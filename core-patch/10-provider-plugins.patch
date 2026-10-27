@@ -104,7 +104,7 @@ index b54c28f6..6ff6e850 100644
          dirName: entry.name,
 diff --git a/server/modules/plugins/provider-plugin-loader.ts b/server/modules/plugins/provider-plugin-loader.ts
 new file mode 100644
-index 00000000..0186416b
+index 00000000..fe5124ce
 --- /dev/null
 +++ b/server/modules/plugins/provider-plugin-loader.ts
 @@ -0,0 +1,119 @@
@@ -116,12 +116,12 @@ index 00000000..0186416b
 +import { sessionsDb } from '@/modules/database/index.js';
 +import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
 +import {
++  McpProvider,
 +  pluginProvidersStore,
 +  type PluginProviderMeta,
 +  providerRegistry,
++  SkillsProvider,
 +} from '@/modules/providers/index.js';
-+import { McpProvider } from '@/modules/providers/shared/mcp/mcp.provider.js';
-+import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
 +import * as imageAttachments from '@/shared/image-attachments.js';
 +import type { IProvider } from '@/shared/interfaces.js';
 +import * as utils from '@/shared/utils.js';
@@ -228,16 +228,19 @@ index 00000000..0186416b
 +  }
 +}
 diff --git a/server/modules/providers/index.ts b/server/modules/providers/index.ts
-index 7ecb4de6..193402ce 100644
+index 7ecb4de6..68a0e599 100644
 --- a/server/modules/providers/index.ts
 +++ b/server/modules/providers/index.ts
-@@ -12,3 +12,7 @@ export { sessionsService } from './services/sessions.service.js';
+@@ -12,3 +12,10 @@ export { sessionsService } from './services/sessions.service.js';
  
  export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
  export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
 +
 +export { pluginProvidersStore, type PluginProviderMeta } from './plugin-providers.store.js';
 +export { providerRegistry } from './provider.registry.js';
++export { McpProvider } from './shared/mcp/mcp.provider.js';
++export { SkillsProvider } from './shared/skills/skills.provider.js';
++
 +
 diff --git a/server/modules/providers/plugin-providers.store.ts b/server/modules/providers/plugin-providers.store.ts
 new file mode 100644
@@ -508,7 +511,7 @@ index d5ce5832..1148d6b4 100644
          return {
            used: 0,
 diff --git a/server/modules/providers/services/sessions-watcher.service.ts b/server/modules/providers/services/sessions-watcher.service.ts
-index 2f9e5a9e..28032e63 100644
+index 2f9e5a9e..5017da6f 100644
 --- a/server/modules/providers/services/sessions-watcher.service.ts
 +++ b/server/modules/providers/services/sessions-watcher.service.ts
 @@ -4,6 +4,7 @@ import { promises as fsPromises } from 'node:fs';
@@ -519,20 +522,17 @@ index 2f9e5a9e..28032e63 100644
  import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
  import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
  import type { LLMProvider } from '@/shared/types.js';
-@@ -106,6 +107,20 @@ let watcherRescheduleAfterRefresh = false;
+@@ -106,6 +107,17 @@ let watcherRescheduleAfterRefresh = false;
   * Filters watcher events to provider-specific session artifact file types.
   */
  function isWatcherTargetFile(provider: LLMProvider, filePath: string): boolean {
 +  const pluginProvider = pluginProvidersStore.get(provider);
 +  if (pluginProvider) {
-+    if (!pluginProvider.meta.isWatchTarget) {
-+      return true;
-+    }
 +    try {
-+      return pluginProvider.meta.isWatchTarget(filePath);
++      return pluginProvider.meta.isWatchTarget?.(filePath) ?? true;
 +    } catch (error) {
 +      const message = error instanceof Error ? error.message : String(error);
-+      console.error(`[SessionsWatcher] isWatchTarget failed for provider "${provider}": ${message}`);
++      console.error(`Plugin isWatchTarget failed for provider "${provider}"`, { filePath, error: message });
 +      return false;
 +    }
 +  }
@@ -540,7 +540,7 @@ index 2f9e5a9e..28032e63 100644
    if (provider === 'opencode') {
      return path.basename(filePath) === 'opencode.db';
    }
-@@ -243,7 +258,11 @@ export async function initializeSessionsWatcher(): Promise<void> {
+@@ -243,7 +255,11 @@ export async function initializeSessionsWatcher(): Promise<void> {
      failures: initialSync.failures,
    });
  
@@ -1146,7 +1146,7 @@ index 7d8186f1..9f61c39e 100644
  };
  
 diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
-index 505f0d15..267a329f 100644
+index 505f0d15..a5a25d81 100644
 --- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 +++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 @@ -1,6 +1,7 @@
@@ -1220,10 +1220,10 @@ index 505f0d15..267a329f 100644
 +    if (key !== prevPluginIdsRef.current) {
 +      prevPluginIdsRef.current = key;
 +      if (pluginProviderIds.length > 0) {
-+        void Promise.all(pluginProviderIds.map((id) => checkProviderAuthStatus(id)));
++        void refreshProviderAuthStatuses(pluginProviderIds);
 +      }
 +    }
-+  }, [pluginProviderIds, checkProviderAuthStatus]);
++  }, [pluginProviderIds, refreshProviderAuthStatuses]);
 +
    return {
      providerAuthStatus,
