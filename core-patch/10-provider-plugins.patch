@@ -104,10 +104,10 @@ index b54c28f6..6ff6e850 100644
          dirName: entry.name,
 diff --git a/server/modules/plugins/provider-plugin-loader.ts b/server/modules/plugins/provider-plugin-loader.ts
 new file mode 100644
-index 00000000..fe5124ce
+index 00000000..bc295038
 --- /dev/null
 +++ b/server/modules/plugins/provider-plugin-loader.ts
-@@ -0,0 +1,119 @@
+@@ -0,0 +1,122 @@
 +import path from 'node:path';
 +import { pathToFileURL } from 'node:url';
 +
@@ -198,6 +198,9 @@ index 00000000..fe5124ce
 +
 +      if (!provider?.id || !meta?.capabilities) {
 +        throw new Error('provider factory must return { provider, meta } with provider.id and meta.capabilities');
++      }
++      if (meta.capabilities.provider !== provider.id) {
++        throw new Error(`capabilities.provider "${meta.capabilities.provider}" does not match provider id "${provider.id}"`);
 +      }
 +      if (
 +        typeof provider.id !== 'string'
