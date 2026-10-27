@@ -21,14 +21,14 @@ index 98cd213a..dfae6c58 100644
          const distIndexPath = path.join(APP_ROOT, 'dist', 'index.html');
          const isProduction = fs.existsSync(distIndexPath);
 diff --git a/server/modules/commands/commands.routes.ts b/server/modules/commands/commands.routes.ts
-index 46745e7a..b592dcd3 100644
+index 46745e7a..a351087b 100644
 --- a/server/modules/commands/commands.routes.ts
 +++ b/server/modules/commands/commands.routes.ts
 @@ -4,6 +4,7 @@ import path from "path";
  import express from "express";
  
  import { parseFrontMatter } from "../../shared/frontmatter.js";
-+import { pluginProvidersStore } from "../providers/plugin-providers.store.js";
++import { pluginProvidersStore } from "../providers/index.js";
  
  type CommandsRouterDependencies = {
    fileSystem: typeof import('node:fs/promises');
@@ -104,10 +104,10 @@ index b54c28f6..6ff6e850 100644
          dirName: entry.name,
 diff --git a/server/modules/plugins/provider-plugin-loader.ts b/server/modules/plugins/provider-plugin-loader.ts
 new file mode 100644
-index 00000000..d9550c70
+index 00000000..fdb5603f
 --- /dev/null
 +++ b/server/modules/plugins/provider-plugin-loader.ts
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,115 @@
 +import path from 'node:path';
 +import { pathToFileURL } from 'node:url';
 +
@@ -118,8 +118,8 @@ index 00000000..d9550c70
 +import {
 +  pluginProvidersStore,
 +  type PluginProviderMeta,
-+} from '@/modules/providers/plugin-providers.store.js';
-+import { providerRegistry } from '@/modules/providers/provider.registry.js';
++  providerRegistry,
++} from '@/modules/providers/index.js';
 +import { McpProvider } from '@/modules/providers/shared/mcp/mcp.provider.js';
 +import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
 +import * as imageAttachments from '@/shared/image-attachments.js';
@@ -199,6 +199,12 @@ index 00000000..d9550c70
 +      if (!provider?.id || !meta?.capabilities) {
 +        throw new Error('provider factory must return { provider, meta } with provider.id and meta.capabilities');
 +      }
++      if (typeof provider.id !== 'string' || !/^[a-z0-9_-]+$/.test(provider.id)) {
++        throw new Error(`invalid provider id "${provider.id}": must be lowercase alphanumeric, dashes or underscores`);
++      }
++      if (provider.id === 'plain-shell') {
++        throw new Error('provider id "plain-shell" is reserved');
++      }
 +      if (providerRegistry.hasProvider(provider.id)) {
 +        throw new Error(`provider id "${provider.id}" is already registered`);
 +      }
@@ -217,9 +223,21 @@ index 00000000..d9550c70
 +    }
 +  }
 +}
+diff --git a/server/modules/providers/index.ts b/server/modules/providers/index.ts
+index 7ecb4de6..193402ce 100644
+--- a/server/modules/providers/index.ts
++++ b/server/modules/providers/index.ts
+@@ -12,3 +12,7 @@ export { sessionsService } from './services/sessions.service.js';
+ 
+ export { initializeSessionsWatcher } from './services/sessions-watcher.service.js';
+ export { closeSessionsWatcher } from './services/sessions-watcher.service.js';
++
++export { pluginProvidersStore, type PluginProviderMeta } from './plugin-providers.store.js';
++export { providerRegistry } from './provider.registry.js';
++
 diff --git a/server/modules/providers/plugin-providers.store.ts b/server/modules/providers/plugin-providers.store.ts
 new file mode 100644
-index 00000000..894a922d
+index 00000000..836de9fe
 --- /dev/null
 +++ b/server/modules/providers/plugin-providers.store.ts
 @@ -0,0 +1,89 @@
@@ -486,7 +504,7 @@ index d5ce5832..1148d6b4 100644
          return {
            used: 0,
 diff --git a/server/modules/providers/services/sessions-watcher.service.ts b/server/modules/providers/services/sessions-watcher.service.ts
-index 2f9e5a9e..7d3143b8 100644
+index 2f9e5a9e..28032e63 100644
 --- a/server/modules/providers/services/sessions-watcher.service.ts
 +++ b/server/modules/providers/services/sessions-watcher.service.ts
 @@ -4,6 +4,7 @@ import { promises as fsPromises } from 'node:fs';
@@ -497,19 +515,28 @@ index 2f9e5a9e..7d3143b8 100644
  import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
  import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
  import type { LLMProvider } from '@/shared/types.js';
-@@ -106,6 +107,11 @@ let watcherRescheduleAfterRefresh = false;
+@@ -106,6 +107,20 @@ let watcherRescheduleAfterRefresh = false;
   * Filters watcher events to provider-specific session artifact file types.
   */
  function isWatcherTargetFile(provider: LLMProvider, filePath: string): boolean {
 +  const pluginProvider = pluginProvidersStore.get(provider);
 +  if (pluginProvider) {
-+    return pluginProvider.meta.isWatchTarget?.(filePath) ?? true;
++    if (!pluginProvider.meta.isWatchTarget) {
++      return true;
++    }
++    try {
++      return pluginProvider.meta.isWatchTarget(filePath);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      console.error(`[SessionsWatcher] isWatchTarget failed for provider "${provider}": ${message}`);
++      return false;
++    }
 +  }
 +
    if (provider === 'opencode') {
      return path.basename(filePath) === 'opencode.db';
    }
-@@ -243,7 +249,11 @@ export async function initializeSessionsWatcher(): Promise<void> {
+@@ -243,7 +258,11 @@ export async function initializeSessionsWatcher(): Promise<void> {
      failures: initialSync.failures,
    });
  
@@ -523,30 +550,36 @@ index 2f9e5a9e..7d3143b8 100644
        await fsPromises.mkdir(rootPath, { recursive: true });
  
 diff --git a/server/modules/websocket/services/shell-websocket.service.ts b/server/modules/websocket/services/shell-websocket.service.ts
-index 84db54c9..8068652a 100644
+index 84db54c9..127cea91 100644
 --- a/server/modules/websocket/services/shell-websocket.service.ts
 +++ b/server/modules/websocket/services/shell-websocket.service.ts
 @@ -5,6 +5,7 @@ import path from 'node:path';
  import pty, { type IPty } from 'node-pty';
  import { WebSocket, type RawData } from 'ws';
  
-+import { pluginProvidersStore } from '@/modules/providers/plugin-providers.store.js';
++import { pluginProvidersStore } from '@/modules/providers/index.js';
  import { parseIncomingJsonObject, stripAnsiSequences } from '@/shared/utils.js';
  
  type ShellIncomingMessage = {
-@@ -226,6 +227,11 @@ function buildShellCommand(
+@@ -226,6 +227,17 @@ function buildShellCommand(
      return otherProgram(initialCommand);
    }
  
-+  const pluginShellCommand = pluginProvidersStore.get(provider)?.meta.shellCommand;
-+  if (pluginShellCommand) {
-+    return otherProgram(pluginShellCommand({ resumeSessionId, projectPath }));
++  const pluginProvider = pluginProvidersStore.get(provider);
++  if (pluginProvider) {
++    if (!pluginProvider.meta.shellCommand) {
++      throw new Error(`Provider "${provider}" does not support terminal sessions`);
++    }
++    return otherProgram(pluginProvider.meta.shellCommand({
++      resumeSessionId: resumeSessionId || null,
++      projectPath,
++    }));
 +  }
 +
    if (provider === 'cursor') {
      if (resumeSessionId) {
        return otherProgram(`cursor-agent --resume="${resumeSessionId}"`);
-@@ -789,7 +795,7 @@ export function handleShellConnection(
+@@ -789,7 +801,7 @@ export function handleShellConnection(
                  ? 'Codex'
                  : provider === 'opencode'
                      ? 'OpenCode'
@@ -556,7 +589,7 @@ index 84db54c9..8068652a 100644
              ? `\x1b[36mResuming ${providerName} session ${resumeSessionId} in: ${projectPath}\x1b[0m\r\n`
              : `\x1b[36mStarting new ${providerName} session in: ${projectPath}\x1b[0m\r\n`;
 diff --git a/src/modules/chat/ChatInterface.tsx b/src/modules/chat/ChatInterface.tsx
-index 145e9a2b..3971ae69 100644
+index 145e9a2b..c408b193 100644
 --- a/src/modules/chat/ChatInterface.tsx
 +++ b/src/modules/chat/ChatInterface.tsx
 @@ -9,6 +9,7 @@ import PermissionContext from '@/modules/chat/context/PermissionContext';
@@ -567,7 +600,15 @@ index 145e9a2b..3971ae69 100644
  import type {
    ChatMessage,
    Project,
-@@ -436,7 +437,7 @@ function ChatInterface({
+@@ -114,6 +115,7 @@ function ChatInterface({
+     pendingPermissionRequests,
+     setPendingPermissionRequests,
+     availablePermissionModes,
++    permissionModeOptions,
+     selectPermissionMode,
+     cyclePermissionMode,
+     providerModelCatalog,
+@@ -436,7 +438,7 @@ function ChatInterface({
          ? t('messageTypes.codex')
          : provider === 'opencode'
              ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
@@ -576,6 +617,95 @@ index 145e9a2b..3971ae69 100644
  
    if (!selectedProject) {
      return (
+@@ -542,6 +544,7 @@ function ChatInterface({
+           onAbortSession={handleAbortSession}
+           permissionMode={permissionMode}
+           availablePermissionModes={availablePermissionModes}
++          permissionModeOptions={permissionModeOptions}
+           onSelectPermissionMode={selectPermissionMode}
+           providerLabel={selectedProviderLabel}
+           effort={currentProviderEffort}
+diff --git a/src/modules/chat/composer/ChatComposer.tsx b/src/modules/chat/composer/ChatComposer.tsx
+index 6f3fd660..8018f44f 100644
+--- a/src/modules/chat/composer/ChatComposer.tsx
++++ b/src/modules/chat/composer/ChatComposer.tsx
+@@ -36,7 +36,7 @@ import BackgroundSendDialog from '@/modules/chat/composer/BackgroundSendDialog';
+ import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
+ import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
+ import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
+-import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
++import ComposerPermissionMenu, { type PermissionModeOptions } from '@/modules/chat/composer/ComposerPermissionMenu';
+ 
+ type MentionableFile = {
+   name: string;
+@@ -55,6 +55,7 @@ type ChatComposerProps = {
+   onAbortSession: () => void;
+   permissionMode: PermissionMode;
+   availablePermissionModes: PermissionMode[];
++  permissionModeOptions?: PermissionModeOptions;
+   onSelectPermissionMode: (mode: PermissionMode) => void;
+   providerLabel: string;
+   effort: string;
+@@ -132,6 +133,7 @@ export default function ChatComposer({
+   onAbortSession,
+   permissionMode,
+   availablePermissionModes,
++  permissionModeOptions,
+   onSelectPermissionMode,
+   providerLabel,
+   effort,
+@@ -501,6 +503,7 @@ export default function ChatComposer({
+             <ComposerPermissionMenu
+               permissionMode={permissionMode}
+               permissionModes={availablePermissionModes}
++              permissionModeOptions={permissionModeOptions}
+               onSelectPermissionMode={onSelectPermissionMode}
+               providerLabel={providerLabel}
+             />
+diff --git a/src/modules/chat/composer/ComposerPermissionMenu.tsx b/src/modules/chat/composer/ComposerPermissionMenu.tsx
+index a7ad195e..dbbab981 100644
+--- a/src/modules/chat/composer/ComposerPermissionMenu.tsx
++++ b/src/modules/chat/composer/ComposerPermissionMenu.tsx
+@@ -78,10 +78,13 @@ const UNKNOWN_MODE: ModeAppearance = {
+ const getAppearance = (mode: PermissionMode | string): ModeAppearance =>
+   MODE_APPEARANCE[mode as PermissionMode] ?? UNKNOWN_MODE;
+ 
++export type PermissionModeOptions = Record<string, { label: string; description: string }>;
++
+ type ComposerPermissionMenuProps = {
+   permissionMode: PermissionMode;
+   /** Modes the active provider supports, in the order the backend reports them. */
+   permissionModes: PermissionMode[];
++  permissionModeOptions?: PermissionModeOptions;
+   onSelectPermissionMode: (mode: PermissionMode) => void;
+   providerLabel: string;
+ };
+@@ -93,6 +96,7 @@ type ComposerPermissionMenuProps = {
+ function ComposerPermissionMenu({
+   permissionMode,
+   permissionModes,
++  permissionModeOptions,
+   onSelectPermissionMode,
+   providerLabel,
+ }: ComposerPermissionMenuProps) {
+@@ -101,7 +105,7 @@ function ComposerPermissionMenu({
+   const close = useCallback(() => setIsOpen(false), []);
+   const { triggerRef, menuRef, anchor, updateAnchor } = useComposerMenuAnchor(isOpen, close, 22 * 16);
+   const modeLabel = (mode: PermissionMode) =>
+-    t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
++    permissionModeOptions?.[mode]?.label ?? t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
+   const activeModeLabel = modeLabel(permissionMode);
+   // The name is shown only where the composer has room for it, so it never
+   // pushes the model menu and the send button onto a second row. Plan mode,
+@@ -161,7 +165,7 @@ function ComposerPermissionMenu({
+                 key={mode}
+                 icon={<ModeIcon className="h-4 w-4" />}
+                 label={modeLabel(mode)}
+-                description={t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined}
++                description={permissionModeOptions?.[mode]?.description ?? (t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined)}
+                 isSelected={mode === permissionMode}
+                 onSelect={() => {
+                   onSelectPermissionMode(mode);
 diff --git a/src/modules/chat/composer/PermissionRequestsBanner.tsx b/src/modules/chat/composer/PermissionRequestsBanner.tsx
 index fe7b55d8..02d6e71b 100644
 --- a/src/modules/chat/composer/PermissionRequestsBanner.tsx
@@ -651,7 +781,7 @@ index 5e4d651d..82fbc883 100644
      `# ${input.sessionTitle}`,
      '',
 diff --git a/src/modules/chat/hooks/useChatProviderState.ts b/src/modules/chat/hooks/useChatProviderState.ts
-index 8a9b5345..ff1119a5 100644
+index 8a9b5345..67eff953 100644
 --- a/src/modules/chat/hooks/useChatProviderState.ts
 +++ b/src/modules/chat/hooks/useChatProviderState.ts
 @@ -11,6 +11,7 @@ import type { PendingPermissionRequest, PermissionMode,
@@ -662,7 +792,15 @@ index 8a9b5345..ff1119a5 100644
  
  const FALLBACK_PROVIDER_EFFORT_VALUES: Partial<Record<LLMProvider, readonly string[]>> = {
    // Superset used only before the model catalog loads; `ultracode` belongs to the
-@@ -135,14 +136,14 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -56,6 +57,7 @@ const FALLBACK_PERMISSION_MODES: Record<LLMProvider, PermissionMode[]> = {
+ type ProviderCapabilities = {
+   provider: LLMProvider;
+   permissionModes: string[];
++  permissionModeOptions?: Record<string, { label: string; description: string }>;
+   defaultPermissionMode: string;
+   supportsImages: boolean;
+   supportsFiles: boolean;
+@@ -135,14 +137,14 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
    // must restore the model that provider was last used with, and the catalogue
    // that validates them arrives asynchronously per provider.
    const [providerModels, setProviderModels] = useState<Record<LLMProvider, string>>(() => {
@@ -680,7 +818,7 @@ index 8a9b5345..ff1119a5 100644
        acc[targetProvider] = localStorage.getItem(`${targetProvider}-effort`) || DEFAULT_EFFORT_VALUE;
        return acc;
      }, {});
-@@ -164,6 +165,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -164,6 +166,10 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
    >({});
    const [providerModelsLoading, setProviderModelsLoading] = useState(true);
  
@@ -691,7 +829,7 @@ index 8a9b5345..ff1119a5 100644
    const providerModelsRequestIdRef = useRef(0);
    const sessionSelectionLoadRequestIdRef = useRef(0);
    const sessionModelMutationIdRef = useRef(0);
-@@ -196,7 +201,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -196,7 +202,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
        // Each provider lands in the catalog as soon as it answers, so a slow
        // one (OpenCode shells out to its CLI) cannot hold back the others.
        await Promise.all(
@@ -700,7 +838,7 @@ index 8a9b5345..ff1119a5 100644
            try {
              const response = await api.providers.models(p);
              const body = (await response.json()) as ProviderModelsApiResponse;
-@@ -216,7 +221,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -216,7 +222,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
          setProviderModelsLoading(false);
        }
      }
@@ -709,7 +847,7 @@ index 8a9b5345..ff1119a5 100644
  
    useEffect(() => {
      void loadProviderModels();
-@@ -350,7 +355,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -350,7 +356,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
    useEffect(() => {
      const reconciledModels: Partial<Record<LLMProvider, string>> = {};
  
@@ -718,7 +856,7 @@ index 8a9b5345..ff1119a5 100644
        const catalog = providerModelCatalog[targetProvider];
        if (!catalog) {
          continue;
-@@ -371,13 +376,13 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -371,13 +377,13 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
      if (Object.keys(reconciledModels).length > 0) {
        setProviderModels((previous) => ({ ...previous, ...reconciledModels }));
      }
@@ -734,7 +872,7 @@ index 8a9b5345..ff1119a5 100644
        const currentEffort = providerEfforts[targetProvider] ?? DEFAULT_EFFORT_VALUE;
        const nextEffort = reconcileStoredEffort(targetProvider, providerModels[targetProvider], currentEffort);
        if (nextEffort === currentEffort) {
-@@ -392,7 +397,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+@@ -392,7 +398,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
      if (hasUpdates) {
        setProviderEfforts((previous) => ({ ...previous, ...nextEfforts }));
      }
@@ -743,6 +881,14 @@ index 8a9b5345..ff1119a5 100644
  
    useEffect(() => {
      const validModes = getPermissionModesForProvider(provider);
+@@ -827,6 +833,7 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+     pendingPermissionRequests,
+     setPendingPermissionRequests,
+     availablePermissionModes,
++    permissionModeOptions: providerCapabilities?.[provider]?.permissionModeOptions,
+     selectPermissionMode,
+     cyclePermissionMode,
+     providerModelCatalog,
 diff --git a/src/modules/chat/modals/CommandResultModal.tsx b/src/modules/chat/modals/CommandResultModal.tsx
 index 00c30822..8434392b 100644
 --- a/src/modules/chat/modals/CommandResultModal.tsx
@@ -809,7 +955,7 @@ index 761f43b0..c50e5cda 100644
              </div>
            )}
 diff --git a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
-index 28b778f0..3cf600eb 100644
+index 28b778f0..d41a9aae 100644
 --- a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
 +++ b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
 @@ -25,6 +25,7 @@ import {
@@ -837,7 +983,7 @@ index 28b778f0..3cf600eb 100644
 +  const providerMeta = useMemo(
 +    () => [
 +      ...PROVIDER_META,
-+      ...pluginProviders.map((plugin) => ({ id: plugin.id, name: plugin.description || plugin.label })),
++      ...pluginProviders.map((plugin) => ({ id: plugin.id, name: plugin.label })),
 +    ],
 +    [pluginProviders],
 +  );
@@ -996,18 +1142,19 @@ index 7d8186f1..9f61c39e 100644
  };
  
 diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
-index 505f0d15..3cd211fc 100644
+index 505f0d15..76fd5772 100644
 --- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 +++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
 @@ -1,6 +1,7 @@
- import { useCallback, useState } from 'react';
+-import { useCallback, useState } from 'react';
++import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
  
  import { api } from '@/shared/api';
-+import { withPluginProviderIds } from '@/shared/providerRegistry';
++import { usePluginProviders, withPluginProviderIds } from '@/shared/providerRegistry';
  import type {
    LLMProvider,
    ProviderAuthStatus,
-@@ -121,7 +122,7 @@ export function useProviderAuthStatus(
+@@ -121,10 +122,27 @@ export function useProviderAuthStatus(
      }
    }, [setProviderLoading, setProviderStatus]);
  
@@ -1016,6 +1163,26 @@ index 505f0d15..3cd211fc 100644
      await Promise.all(providers.map((provider) => checkProviderAuthStatus(provider)));
    }, [checkProviderAuthStatus]);
  
++  const pluginProviders = usePluginProviders();
++  const pluginProviderIds = useMemo(
++    () => pluginProviders.map((p) => p.id),
++    [pluginProviders],
++  );
++
++  const prevPluginIdsRef = useRef<string>('');
++  useEffect(() => {
++    const key = pluginProviderIds.join(',');
++    if (key !== prevPluginIdsRef.current) {
++      prevPluginIdsRef.current = key;
++      if (pluginProviderIds.length > 0) {
++        void Promise.all(pluginProviderIds.map((id) => checkProviderAuthStatus(id)));
++      }
++    }
++  }, [pluginProviderIds, checkProviderAuthStatus]);
++
+   return {
+     providerAuthStatus,
+     checkProviderAuthStatus,
 diff --git a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx b/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
 index e9d2afb7..f0ddda90 100644
 --- a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
@@ -1337,10 +1504,10 @@ index 7c485fa4..a0a4a847 100644
  
 diff --git a/src/shared/providerRegistry.ts b/src/shared/providerRegistry.ts
 new file mode 100644
-index 00000000..7f55e699
+index 00000000..e09c7dd4
 --- /dev/null
 +++ b/src/shared/providerRegistry.ts
-@@ -0,0 +1,116 @@
+@@ -0,0 +1,117 @@
 +import { useEffect, useSyncExternalStore } from 'react';
 +
 +import { api } from '@/shared/api';
@@ -1400,6 +1567,7 @@ index 00000000..7f55e699
 +      const response = await api.providers.registry();
 +      const body = (await response.json()) as { success?: boolean; data?: { providers?: PluginProviderInfo[] } };
 +      if (!body.success || !Array.isArray(body.data?.providers)) {
++        loadRequest = null;
 +        return;
 +      }
 +
@@ -1517,121 +1685,3 @@ index 16bbc489..ec2102a9 100644
 +
    return <ClaudeLogo className={className} />;
  }
-
-diff --git a/src/modules/chat/hooks/useChatProviderState.ts b/src/modules/chat/hooks/useChatProviderState.ts
---- a/src/modules/chat/hooks/useChatProviderState.ts
-+++ b/src/modules/chat/hooks/useChatProviderState.ts
-@@ -57,6 +57,7 @@
- type ProviderCapabilities = {
-   provider: LLMProvider;
-   permissionModes: string[];
-+  permissionModeOptions?: Record<string, { label: string; description: string }>;
-   defaultPermissionMode: string;
-   supportsImages: boolean;
-   supportsFiles: boolean;
-@@ -832,6 +833,7 @@
-     pendingPermissionRequests,
-     setPendingPermissionRequests,
-     availablePermissionModes,
-+    permissionModeOptions: providerCapabilities?.[provider]?.permissionModeOptions,
-     selectPermissionMode,
-     cyclePermissionMode,
-     providerModelCatalog,
-diff --git a/src/modules/chat/ChatInterface.tsx b/src/modules/chat/ChatInterface.tsx
---- a/src/modules/chat/ChatInterface.tsx
-+++ b/src/modules/chat/ChatInterface.tsx
-@@ -115,6 +115,7 @@
-     pendingPermissionRequests,
-     setPendingPermissionRequests,
-     availablePermissionModes,
-+    permissionModeOptions,
-     selectPermissionMode,
-     cyclePermissionMode,
-     providerModelCatalog,
-@@ -543,6 +544,7 @@
-           onAbortSession={handleAbortSession}
-           permissionMode={permissionMode}
-           availablePermissionModes={availablePermissionModes}
-+          permissionModeOptions={permissionModeOptions}
-           onSelectPermissionMode={selectPermissionMode}
-           providerLabel={selectedProviderLabel}
-           effort={currentProviderEffort}
-diff --git a/src/modules/chat/composer/ChatComposer.tsx b/src/modules/chat/composer/ChatComposer.tsx
---- a/src/modules/chat/composer/ChatComposer.tsx
-+++ b/src/modules/chat/composer/ChatComposer.tsx
-@@ -36,7 +36,7 @@
- import { ScheduleMessagePopover } from '@/modules/chat/composer/ScheduleMessagePopover';
- import { ScheduledMessageList } from '@/modules/chat/composer/ScheduledMessageList';
- import ComposerModelMenu from '@/modules/chat/composer/ComposerModelMenu';
--import ComposerPermissionMenu from '@/modules/chat/composer/ComposerPermissionMenu';
-+import ComposerPermissionMenu, { type PermissionModeOptions } from '@/modules/chat/composer/ComposerPermissionMenu';
- 
- type MentionableFile = {
-   name: string;
-@@ -55,6 +55,7 @@
-   onAbortSession: () => void;
-   permissionMode: PermissionMode;
-   availablePermissionModes: PermissionMode[];
-+  permissionModeOptions?: PermissionModeOptions;
-   onSelectPermissionMode: (mode: PermissionMode) => void;
-   providerLabel: string;
-   effort: string;
-@@ -132,6 +133,7 @@
-   onAbortSession,
-   permissionMode,
-   availablePermissionModes,
-+  permissionModeOptions,
-   onSelectPermissionMode,
-   providerLabel,
-   effort,
-@@ -501,6 +503,7 @@
-             <ComposerPermissionMenu
-               permissionMode={permissionMode}
-               permissionModes={availablePermissionModes}
-+              permissionModeOptions={permissionModeOptions}
-               onSelectPermissionMode={onSelectPermissionMode}
-               providerLabel={providerLabel}
-             />
-diff --git a/src/modules/chat/composer/ComposerPermissionMenu.tsx b/src/modules/chat/composer/ComposerPermissionMenu.tsx
---- a/src/modules/chat/composer/ComposerPermissionMenu.tsx
-+++ b/src/modules/chat/composer/ComposerPermissionMenu.tsx
-@@ -78,10 +78,13 @@
- const getAppearance = (mode: PermissionMode | string): ModeAppearance =>
-   MODE_APPEARANCE[mode as PermissionMode] ?? UNKNOWN_MODE;
- 
-+export type PermissionModeOptions = Record<string, { label: string; description: string }>;
-+
- type ComposerPermissionMenuProps = {
-   permissionMode: PermissionMode;
-   /** Modes the active provider supports, in the order the backend reports them. */
-   permissionModes: PermissionMode[];
-+  permissionModeOptions?: PermissionModeOptions;
-   onSelectPermissionMode: (mode: PermissionMode) => void;
-   providerLabel: string;
- };
-@@ -93,6 +96,7 @@
- function ComposerPermissionMenu({
-   permissionMode,
-   permissionModes,
-+  permissionModeOptions,
-   onSelectPermissionMode,
-   providerLabel,
- }: ComposerPermissionMenuProps) {
-@@ -101,7 +105,7 @@
-   const close = useCallback(() => setIsOpen(false), []);
-   const { triggerRef, menuRef, anchor, updateAnchor } = useComposerMenuAnchor(isOpen, close, 22 * 16);
-   const modeLabel = (mode: PermissionMode) =>
--    t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
-+    permissionModeOptions?.[mode]?.label ?? t(`codex.modes.${mode}`, { defaultValue: getAppearance(mode).label || mode });
-   const activeModeLabel = modeLabel(permissionMode);
-   // The name is shown only where the composer has room for it, so it never
-   // pushes the model menu and the send button onto a second row. Plan mode,
-@@ -161,7 +165,7 @@
-                 key={mode}
-                 icon={<ModeIcon className="h-4 w-4" />}
-                 label={modeLabel(mode)}
--                description={t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined}
-+                description={permissionModeOptions?.[mode]?.description ?? (t(`codex.descriptions.${mode}`, { defaultValue: '' }) || undefined)}
-                 isSelected={mode === permissionMode}
-                 onSelect={() => {
-                   onSelectPermissionMode(mode);
